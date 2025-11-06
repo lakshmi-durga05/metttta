@@ -1,9 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
-import { VRButton } from "three/examples/jsm/webxr/VRButton.js";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { io, Socket } from "socket.io-client";
-
 export default function App() {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const xrBtnRef = useRef<HTMLDivElement | null>(null);
@@ -20,6 +18,7 @@ export default function App() {
   const [displayName, setDisplayName] = useState<string>(`Guest-${Math.floor(Math.random()*1000)}`);
   const [roomCodeInput, setRoomCodeInput] = useState<string>("");
   const nameRef = useRef<string>("");
+  const tabTagRef = useRef<string>("");
   const remoteAvatarsRef = useRef<Record<string, THREE.Object3D>>({});
   const sceneRef = useRef<THREE.Scene | null>(null);
   const remoteGroupRef = useRef<THREE.Group | null>(null);
@@ -30,6 +29,10 @@ export default function App() {
   const remoteStreamsRef = useRef<Record<string, MediaStream>>({});
   const audioCtxRef = useRef<AudioContext | null>(null);
   const remoteAudioRef = useRef<Record<string, { source: MediaStreamAudioSourceNode; panner: PannerNode }>>({});
+  const remoteAudioElsRef = useRef<Record<string, HTMLAudioElement>>({});
+  const micAnalyserRef = useRef<AnalyserNode | null>(null);
+  const micLevelRafRef = useRef<number | null>(null);
+  const [micLevel, setMicLevel] = useState<number>(0);
   const [, forceRerender] = useState(0);
   const [authOpen, setAuthOpen] = useState<boolean>(false);
   const [authedUser, setAuthedUser] = useState<{ id: string; name: string; email: string; avatar: { kind: 'color' | 'image'; value: string } } | null>(null);
@@ -55,19 +58,63 @@ export default function App() {
   const moveTargetRef = useRef<THREE.Vector3 | null>(null);
   const micMonitorRef = useRef<{ source: MediaStreamAudioSourceNode; gain: GainNode } | null>(null);
   const [transcript, setTranscript] = useState<string>("");
+  const transcriptRef = useRef<string>("");
   const [summaries, setSummaries] = useState<string[]>([]);
   const [chatOpen, setChatOpen] = useState<boolean>(true);
   const [chatInput, setChatInput] = useState<string>("");
   const [chatLog, setChatLog] = useState<Array<{userId:string; name:string; text:string; ts:number}>>([]);
   const [meetingEnded, setMeetingEnded] = useState<boolean>(false);
   const [medMode, setMedMode] = useState<boolean>(false);
+  const meetingEndedRef = useRef<boolean>(false);
   const chatSeenRef = useRef<Set<string>>(new Set());
   const chatListRef = useRef<HTMLDivElement | null>(null);
+  const [dashboardOpen, setDashboardOpen] = useState<boolean>(false);
+  const [meetings, setMeetings] = useState<Array<{ id:string; roomId:string|null; ts:number; title:string; summary:string[]; transcript:string; participants:Array<{id:string; name:string}>; whiteboardImage?:string; chat:Array<{userId:string; name:string; text:string; ts:number}> }>>([]);
+  const recognitionRef = useRef<any>(null);
+  const [sttAvailable, setSttAvailable] = useState<boolean>(true);
+  const sttManualStopRef = useRef<boolean>(false);
+  const [sttStatus, setSttStatus] = useState<'idle'|'running'|'stopped'|'unsupported'|'not_joined'>('idle');
+  const startRecognition = () => {
+    try {
+      const SR: any = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (!SR) { setSttAvailable(false); setSttStatus('unsupported'); return; }
+      if (!joined || meetingEnded) { setSttStatus('not_joined'); return; }
+      sttManualStopRef.current = false;
+      if (recognitionRef.current) { try { recognitionRef.current.start(); } catch {} return; }
+      const rec: any = new SR();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.lang = (navigator.language || 'en-US');
+      let buffer = '';
+      rec.onresult = (e: any) => {
+        let interim = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          const res = e.results[i];
+          if (res.isFinal) buffer += res[0].transcript + ' ';
+          else interim += res[0].transcript;
+        }
+        const full = (buffer + ' ' + interim).trim();
+        transcriptRef.current = full;
+        setTranscript(full);
+      };
+      rec.onerror = (e: any) => {
+        const name = (e?.error || '').toString();
+        if (name.includes('not-allowed') || name.includes('service-not-allowed')) return;
+        if (!sttManualStopRef.current) { try { rec.start(); } catch {} }
+      };
+      rec.onend = () => { if (!meetingEnded && !sttManualStopRef.current) { try { rec.start(); } catch {} } };
+      try { rec.start(); } catch {}
+      recognitionRef.current = rec;
+      setSttStatus('running');
+    } catch {}
+  };
   // Whiteboard state
   const [wbOpen, setWbOpen] = useState<boolean>(false);
   const wbCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const [wbColor, setWbColor] = useState<string>("#1f2937");
   const [wbSize, setWbSize] = useState<number>(4);
+  const [micBusy, setMicBusy] = useState<boolean>(false);
+  const [camBusy, setCamBusy] = useState<boolean>(false);
   const wbDrawingRef = useRef<boolean>(false);
   const wbPointsRef = useRef<Array<[number, number]>>([]);
   const wbCtxRef = useRef<CanvasRenderingContext2D | null>(null);
@@ -82,6 +129,18 @@ export default function App() {
   const modelUrlForAvatar = (val: string) => {
     const idx = Math.max(0, avatarGallery.indexOf(val));
     return modelUrls[idx % modelUrls.length];
+  };
+  const handleWbTouchEnd = () => {
+    if (!wbDrawingRef.current) return;
+    wbDrawingRef.current = false;
+    const pts = wbPointsRef.current.slice();
+    wbPointsRef.current = [];
+    if (pts.length > 1) {
+      socketRef.current?.emit('whiteboard:stroke', { color: wbColor, size: wbSize, points: pts, tool: wbToolRef.current });
+    } else if (pts.length === 1) {
+      const p = pts[0];
+      socketRef.current?.emit('whiteboard:stroke', { color: wbColor, size: wbSize, points: [p, [p[0]+0.01, p[1]+0.01]], tool: wbToolRef.current });
+    }
   };
 
   const loadModel = async (url: string): Promise<{ group: THREE.Group; clips: THREE.AnimationClip[] }> => {
@@ -118,6 +177,10 @@ export default function App() {
       } catch {}
     }
     const session = sessionStorage.getItem('sessionAuthed');
+    // Ensure a stable per-tab suffix for visible names
+    let tabTag = sessionStorage.getItem('tabTag');
+    if (!tabTag) { tabTag = Math.random().toString(36).slice(2,5); sessionStorage.setItem('tabTag', tabTag); }
+    tabTagRef.current = tabTag;
     setSessionReady(session === '1');
     if (session !== '1') setAuthOpen(true);
     const lastRoom = sessionStorage.getItem('lastRoomId');
@@ -222,7 +285,8 @@ export default function App() {
 
     let rafId = 0;
     const onKey = (e: KeyboardEvent) => {
-      const k = (e?.key || '').toLowerCase();
+      if (meetingEndedRef.current) return;
+      const k = (e?.key || '').toLowerCase();  
       if (!k) return;
       // Do not capture movement keys when typing in form fields
       const target = e.target as HTMLElement | null;
@@ -257,48 +321,52 @@ export default function App() {
       // Local avatar movement (WASD)
       const av = localAvatarRef.current;
       if (av) {
-        let vx = 0, vz = 0;
-        const k = keysRef.current;
-        if (k['w'] || k['arrowup']) vz -= 1;
-        if (k['s'] || k['arrowdown']) vz += 1;
-        if (k['a'] || k['arrowleft']) vx -= 1;
-        if (k['d'] || k['arrowright']) vx += 1;
-        // Click-to-move: steer toward target
-        if (moveTargetRef.current) {
-          const dx = moveTargetRef.current.x - av.position.x;
-          const dz = moveTargetRef.current.z - av.position.z;
-          const dist = Math.hypot(dx, dz);
-          if (dist > 0.02) { vx += dx / dist; vz += dz / dist; } else { moveTargetRef.current = null; }
-        }
-        if (vx !== 0 || vz !== 0) {
-          const len = Math.hypot(vx, vz) || 1;
-          vx /= len; vz /= len;
-          const speed = 1.5; // m/s
-          av.position.x += vx * speed * dt;
-          av.position.z += vz * speed * dt;
-          // animation blend
-          const acts = localActionsRef.current;
-          if (acts.walk && acts.current !== 'walk') {
-            acts.idle?.crossFadeTo(acts.walk, 0.25, false);
-            acts.walk.play();
-            acts.current = 'walk';
+        if (!meetingEnded) {
+          let vx = 0, vz = 0;
+          const k = keysRef.current;
+          if (k['w'] || k['arrowup']) vz -= 1;
+          if (k['s'] || k['arrowdown']) vz += 1;
+          if (k['a'] || k['arrowleft']) vx -= 1;
+          if (k['d'] || k['arrowright']) vx += 1;
+          // Click-to-move: steer toward target
+          if (moveTargetRef.current) {
+            const dx = moveTargetRef.current.x - av.position.x;
+            const dz = moveTargetRef.current.z - av.position.z;
+            const dist = Math.hypot(dx, dz);
+            if (dist > 0.02) { vx += dx / dist; vz += dz / dist; } else { moveTargetRef.current = null; }
+          }
+          if (vx !== 0 || vz !== 0) {
+            const len = Math.hypot(vx, vz) || 1;
+            vx /= len; vz /= len;
+            const speed = 1.5; // m/s
+            av.position.x += vx * speed * dt;
+            av.position.z += vz * speed * dt;
+            // animation blend
+            const acts = localActionsRef.current;
+            if (acts.walk && acts.current !== 'walk') {
+              acts.idle?.crossFadeTo(acts.walk, 0.25, false);
+              acts.walk.play();
+              acts.current = 'walk';
+            }
+          } else {
+            const acts = localActionsRef.current;
+            if (acts.idle && acts.current !== 'idle') {
+              acts.walk?.crossFadeTo(acts.idle, 0.25, false);
+              acts.idle.play();
+              acts.current = 'idle';
+            }
+          }
+          // emit pose at 10 Hz
+          const now = performance.now();
+          if (socketRef.current && now - lastEmitRef.current > 100) {
+            lastEmitRef.current = now;
+            const r = new THREE.Euler().copy(av.rotation);
+            const p: [number, number, number] = [av.position.x, av.position.y, av.position.z];
+            const rot: [number, number, number] = [r.x, r.y, r.z];
+            socketRef.current.emit('avatar:pose', { userId: userIdRef.current, p, r: rot });
           }
         } else {
-          const acts = localActionsRef.current;
-          if (acts.idle && acts.current !== 'idle') {
-            acts.walk?.crossFadeTo(acts.idle, 0.25, false);
-            acts.idle.play();
-            acts.current = 'idle';
-          }
-        }
-        // emit pose at 10 Hz
-        const now = performance.now();
-        if (socketRef.current && now - lastEmitRef.current > 100) {
-          lastEmitRef.current = now;
-          const r = new THREE.Euler().copy(av.rotation);
-          const p: [number, number, number] = [av.position.x, av.position.y, av.position.z];
-          const rot: [number, number, number] = [r.x, r.y, r.z];
-          socketRef.current.emit('avatar:pose', { userId: userIdRef.current, p, r: rot });
+          moveTargetRef.current = null;
         }
       }
       controls.update();
@@ -364,10 +432,8 @@ export default function App() {
     const socket = io("http://localhost:3001", { transports: ["websocket"], withCredentials: false });
     socketRef.current = socket;
     // Per-tab tag to avoid identical visible names across tabs
-    let tabTag = sessionStorage.getItem('tabTag');
-    if (!tabTag) { tabTag = Math.random().toString(36).slice(2,5); sessionStorage.setItem('tabTag', tabTag); }
     const baseName = nameRef.current || displayName;
-    const nameToUse = `${baseName}-${tabTag}`;
+    const nameToUse = `${baseName}-${tabTagRef.current || ''}`;
     const avatar = authedUser?.avatar || { kind: 'image', value: avatarGallery[0] };
     socket.emit("room:join", { roomId, userId: userIdRef.current, name: nameToUse, avatar });
     // Ensure new joiners sync the current whiteboard state immediately
@@ -483,22 +549,27 @@ export default function App() {
 
     // Whiteboard + Chat listeners (registered after connection)
     socket.on('whiteboard:stroke', (s: { color: string; size: number; points: Array<[number,number]>; tool?: string }) => {
+      if (meetingEndedRef.current) return;
       drawStrokeOnCanvas(s);
     });
     socket.on('whiteboard:clear', () => {
+      if (meetingEndedRef.current) return;
       clearWhiteboardCanvas();
     });
     socket.on('whiteboard:fill', (act: { x:number; y:number; color:string }) => {
+      if (meetingEndedRef.current) return;
       floodFillAt(Math.floor(act.x), Math.floor(act.y), act.color);
     });
     socket.on('whiteboard:state', (state: { actions: Array<any> } ) => {
+      if (meetingEndedRef.current) return;
       clearWhiteboardCanvas();
-      for (const act of state.actions || []) {
+      for (const act of (state.actions || [])) {
         if (act.type === 'stroke') drawStrokeOnCanvas(act);
         if (act.type === 'fill') floodFillAt(Math.floor(act.x), Math.floor(act.y), act.color);
       }
     });
     socket.on('chat:message', (msg: {userId:string; name:string; text:string; ts:number; cid?: string}) => {
+      if (meetingEndedRef.current) return;
       if (msg.cid) {
         if (chatSeenRef.current.has(msg.cid)) return;
         chatSeenRef.current.add(msg.cid);
@@ -507,6 +578,7 @@ export default function App() {
     });
 
     const interval = setInterval(() => {
+      if (meetingEndedRef.current) return;
       if (!localAvatarRef.current) return;
       const p: [number, number, number] = [localAvatarRef.current.position.x, localAvatarRef.current.position.y, localAvatarRef.current.position.z];
       const r: [number, number, number] = [localAvatarRef.current.rotation.x, localAvatarRef.current.rotation.y, localAvatarRef.current.rotation.z];
@@ -556,6 +628,9 @@ export default function App() {
     el.scrollTop = el.scrollHeight;
   }, [chatLog, chatOpen]);
 
+  useEffect(() => { loadMeetings(); }, []);
+  useEffect(() => { meetingEndedRef.current = meetingEnded; }, [meetingEnded]);
+
   const nameForUserId = (uid: string): string => {
     if (uid === userIdRef.current) return authedUser?.name || displayName;
     const m = roster.find(r => r.id === uid);
@@ -570,46 +645,140 @@ export default function App() {
 
   const formatTime = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-  // Simple speech recognition, deferred until End Meeting now (disabled during meeting)
+  const buildSummary = (fullTranscript: string, chatArr: Array<{userId:string; name:string; text:string; ts:number}>) => {
+    const txt = (fullTranscript || '').trim();
+    const chatText = (chatArr || []).map(m=>`${m.name}: ${m.text}`).join(' ');
+    const all = `${txt} ${chatText}`.trim();
+    if (!all) return ["No transcript captured."];
+    const sents = all.split(/(?<=\.|\?|!)\s+/).map(s=>s.trim()).filter(Boolean);
+    const stop = new Set(["the","is","a","an","and","or","to","of","in","on","for","with","that","this","it","as","at","by","be","we","you","they","i","are","was","were","from","our","your","their","will","can","should","could","would","about","into","over","after","before","than","then","so","if","but","not","no","yes","do","does","did"]);
+    const freq: Record<string, number> = {};
+    for (const w of all.toLowerCase().match(/\b[\p{L}0-9']+\b/gu) || []) { if (!stop.has(w) && w.length>2) freq[w]=(freq[w]||0)+1; }
+    const scoreSent = (s: string) => { let sc=0; for (const w of s.toLowerCase().match(/\b[\p{L}0-9']+\b/gu) || []) { if (freq[w]) sc+=freq[w]; } return sc; };
+    const scored = sents.map((s,i)=>({i,s,sc:scoreSent(s)})).sort((a,b)=>b.sc-a.sc).slice(0,8).sort((a,b)=>a.i-b.i).map(o=>o.s);
+    const lowerAll = all.toLowerCase();
+    const acts: string[] = [];
+    for (const line of (txt+"\n"+chatText).split(/\n|\.|\?|!/)) {
+      const l=line.trim(); if(!l) continue;
+      if (/\b(will|todo|to do|next|follow up|assign|ownership|deadline|deliver|prepare|send|share)\b/i.test(l)) acts.push(l);
+    }
+    const decs: string[] = [];
+    for (const line of (txt+"\n"+chatText).split(/\n|\.|\?|!/)) {
+      const l=line.trim(); if(!l) continue;
+      if (/\b(decide|decided|agree|agreed|approved|choose|chose|select|selected)\b/i.test(l)) decs.push(l);
+    }
+    const out: string[] = [];
+    if (scored.length) out.push(`Overview: ${scored.slice(0,3).join(' ')}`);
+    if (scored.length>3) { for (const s of scored.slice(3)) out.push(`Key: ${s}`); }
+    if (decs.length) { out.push('Decisions:'); for (const d of decs.slice(0,6)) out.push(`- ${d}`); }
+    if (acts.length) { out.push('Action items:'); for (const a of acts.slice(0,8)) out.push(`- ${a}`); }
+    return out.length ? out : ["No notable content detected."];
+  };
+
   useEffect(() => {
     let recognition: any = null;
     let stopRequested = false;
     const SpeechRecognition: any = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) return;
-    if (!meetingEnded) return; // run only after meeting ends
+    if (!SpeechRecognition) { setSttAvailable(false); setSttStatus('unsupported'); return; }
+    if (!joined || meetingEnded) { setSttStatus('not_joined'); return; }
+    if (sttManualStopRef.current) { setSttStatus('stopped'); return; }
     recognition = new SpeechRecognition();
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.lang = 'en-US';
-    let buffer = '';
+    recognition.lang = (navigator.language || 'en-US');
+    let recent = '';
     recognition.onresult = (e: any) => {
       let interim = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const res = e.results[i];
-        if (res.isFinal) buffer += res[0].transcript + ' ';
-        else interim += res[0].transcript;
+        if (res.isFinal) {
+          const txt = (res[0]?.transcript || '').trim();
+          if (txt) {
+            transcriptRef.current = ((transcriptRef.current || '') + ' ' + txt).trim();
+            recent = (recent + ' ' + txt).trim();
+          }
+        } else {
+          interim += res[0].transcript;
+        }
       }
-      setTranscript((buffer + ' ' + interim).trim());
+      const display = ((transcriptRef.current || '') + (interim ? (' ' + interim) : '')).trim();
+      setTranscript(display);
     };
+    recognition.onerror = (e: any) => {
+      const name = (e?.error || '').toString();
+      // Do not spin if user explicitly blocked
+      if (name.includes('not-allowed') || name.includes('service-not-allowed')) return;
+      if (!stopRequested && !sttManualStopRef.current) setTimeout(() => { try { recognition.start(); } catch {} }, 1200);
+    };
+    recognition.onaudioend = () => { if (!stopRequested && !sttManualStopRef.current) { try { recognition.start(); } catch {} } };
+    recognition.onsoundend = () => { if (!stopRequested && !sttManualStopRef.current) { try { recognition.start(); } catch {} } };
     recognition.onend = () => {
-      if (!stopRequested) recognition.start();
+      if (!stopRequested && !sttManualStopRef.current) try { recognition.start(); } catch {}
     };
-    try { recognition.start(); } catch {}
+    try { recognition.start(); setSttStatus('running'); } catch {}
+    recognitionRef.current = recognition;
     const summarizer = setInterval(() => {
-      if (!buffer) return;
-      const text = buffer.trim();
+      if (!recent) return;
+      const text = recent.trim();
       const words = text.split(/\s+/);
       const last = words.slice(-40).join(' ');
       const summary = last.length > 0 ? `Recent: ${last}` : '';
       if (summary) setSummaries((prev) => [...prev, summary].slice(-20));
-      buffer = '';
+      recent = '';
     }, 10000);
     return () => {
       stopRequested = true;
       clearInterval(summarizer);
       try { recognition.stop(); } catch {}
+      recognitionRef.current = null;
+      if (!sttManualStopRef.current && joined && !meetingEnded && sttAvailable) setSttStatus('idle');
     };
-  }, [meetingEnded]);
+  }, [joined, meetingEnded, sttAvailable]);
+
+  // Keep STT status in sync with session/support changes
+  useEffect(() => {
+    if (!sttAvailable) { setSttStatus('unsupported'); return; }
+    if (!joined || meetingEnded) { setSttStatus('not_joined'); return; }
+    if (sttManualStopRef.current) { setSttStatus('stopped'); return; }
+    if (!recognitionRef.current) { setSttStatus('idle'); return; }
+  }, [joined, meetingEnded, sttAvailable]);
+
+  const loadMeetings = () => {
+    try {
+      const raw = localStorage.getItem('meetings') || '[]';
+      const arr = JSON.parse(raw);
+      if (Array.isArray(arr)) setMeetings(arr);
+    } catch {}
+  };
+
+  const saveMeeting = (payload: { summary?: string[]; transcript: string; whiteboardImage?: string }) => {
+    const participants = [{ id: userIdRef.current, name: authedUser?.name || displayName }, ...roster.map(r=>({ id: r.id, name: r.name }))]
+      .filter((v,i,a)=> a.findIndex(x=>x.id===v.id)===i);
+    const finalSummary = (payload.summary && payload.summary.length)
+      ? payload.summary
+      : buildSummary(payload.transcript || '', chatLog);
+    const meeting = {
+      id: `m_${Date.now()}`,
+      roomId,
+      ts: Date.now(),
+      title: `Room ${roomId || ''} — ${new Date().toLocaleString()}`.trim(),
+      summary: finalSummary,
+      transcript: payload.transcript,
+      participants,
+      whiteboardImage: payload.whiteboardImage,
+      chat: chatLog.slice(-500)
+    };
+    try {
+      const raw = localStorage.getItem('meetings') || '[]';
+      const arr = JSON.parse(raw);
+      const next = Array.isArray(arr) ? [...arr, meeting] : [meeting];
+      localStorage.setItem('meetings', JSON.stringify(next));
+      setMeetings(next);
+    } catch {
+      localStorage.setItem('meetings', JSON.stringify([meeting]));
+      setMeetings([meeting]);
+    }
+  };
 
   // Render remote avatars in the scene
   useEffect(() => {
@@ -640,6 +809,14 @@ export default function App() {
       if (!e.streams[0]) return;
       remoteStreamsRef.current[peerId] = e.streams[0];
       forceRerender((prev: number) => prev + 1);
+      try {
+        let audioEl = remoteAudioElsRef.current[peerId];
+        if (!audioEl) { audioEl = new Audio(); remoteAudioElsRef.current[peerId] = audioEl; }
+        audioEl.autoplay = true; (audioEl as any).playsInline = true;
+        if (audioEl.srcObject !== e.streams[0]) audioEl.srcObject = e.streams[0];
+        audioEl.volume = 1.0; audioEl.muted = false;
+        audioEl.play().catch(()=>{});
+      } catch {}
     };
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((track: MediaStreamTrack) => pc.addTrack(track, mediaStreamRef.current as MediaStream));
@@ -655,6 +832,8 @@ export default function App() {
     pc.close();
     delete peerConnsRef.current[peerId];
     delete remoteStreamsRef.current[peerId];
+    const a = remoteAudioElsRef.current[peerId];
+    if (a) { try { a.srcObject = null as any; a.remove(); } catch {} delete remoteAudioElsRef.current[peerId]; }
     forceRerender((prev: number) => prev + 1);
   };
 
@@ -664,20 +843,55 @@ export default function App() {
     return peerConnsRef.current[peerId];
   };
 
+  const resumeAllRemoteAudio = async () => {
+    try { if (audioCtxRef.current && audioCtxRef.current.state !== 'running') await audioCtxRef.current.resume(); } catch {}
+    try {
+      const els = Object.values(remoteAudioElsRef.current);
+      for (const a of els) { try { await a.play(); } catch {} }
+    } catch {}
+  };
+
   // Media helpers used by Settings toggles
   const ensureMediaIfNeeded = async () => {
     if (mediaStreamRef.current) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       mediaStreamRef.current = stream;
-      if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+      if (!audioCtxRef.current) {
+        try {
+          audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        } catch {}
+      }
+      // Attempt to resume context on a user gesture
+      try { if (audioCtxRef.current && audioCtxRef.current.state !== 'running') await audioCtxRef.current.resume(); } catch {}
       // Local mic monitor (echo to user when mic enabled)
-      if (audioCtxRef.current && stream.getAudioTracks()[0]) {
-        const src = audioCtxRef.current.createMediaStreamSource(stream);
-        const gain = audioCtxRef.current.createGain();
-        gain.gain.value = 0.0; // start muted until toggled on
-        src.connect(gain).connect(audioCtxRef.current.destination);
-        micMonitorRef.current = { source: src, gain };
+      try {
+        if (audioCtxRef.current && stream.getAudioTracks()[0]) {
+          const src = audioCtxRef.current.createMediaStreamSource(stream);
+          const gain = audioCtxRef.current.createGain();
+          gain.gain.value = 0.0; // start muted until toggled on
+          src.connect(gain).connect(audioCtxRef.current.destination);
+          micMonitorRef.current = { source: src, gain };
+          // Create analyser for mic level meter
+          const analyser = audioCtxRef.current.createAnalyser();
+          analyser.fftSize = 256;
+          micAnalyserRef.current = analyser;
+          try { src.connect(analyser); } catch {}
+          // start update loop (will show ~0 until mic unmuted)
+          const data = new Uint8Array(analyser.frequencyBinCount);
+          const loop = () => {
+            try { analyser.getByteTimeDomainData(data); } catch {}
+            // RMS of waveform
+            let sum = 0; for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v*v; }
+            const rms = Math.sqrt(sum / data.length);
+            setMicLevel(Math.min(1, rms * 2));
+            micLevelRafRef.current = requestAnimationFrame(loop);
+          };
+          micLevelRafRef.current = requestAnimationFrame(loop);
+        }
+      } catch {
+        // If WebAudio fails, continue without local monitor
+        micMonitorRef.current = null;
       }
     } catch (e) {
       setErrorMsg('Failed to access media devices');
@@ -778,6 +992,7 @@ export default function App() {
   };
 
   const handleWbPointerDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (meetingEnded) return;
     const canvas = wbCanvasRef.current; if (!canvas) return;
     if (wbToolRef.current === 'fill') {
       const [x,y] = pointerToCanvasXY(canvas, e.clientX, e.clientY);
@@ -790,6 +1005,7 @@ export default function App() {
     wbPointsRef.current.push([x, y]);
   };
   const handleWbPointerMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (meetingEnded) return;
     if (!wbDrawingRef.current) return;
     const canvas = wbCanvasRef.current; if (!canvas) return;
     const [x, y] = pointerToCanvasXY(canvas, e.clientX, e.clientY);
@@ -804,15 +1020,21 @@ export default function App() {
     }
   };
   const handleWbPointerUp = () => {
+    if (meetingEnded) return;
     if (!wbDrawingRef.current) return;
     wbDrawingRef.current = false;
     const pts = wbPointsRef.current.slice();
     wbPointsRef.current = [];
-    if (pts.length <= 2 && pts.length > 0) {
+    if (pts.length > 1) {
       socketRef.current?.emit('whiteboard:stroke', { color: wbColor, size: wbSize, points: pts, tool: wbToolRef.current });
+    } else if (pts.length === 1) {
+      // Emit a tiny dot to reflect a click without movement
+      const p = pts[0];
+      socketRef.current?.emit('whiteboard:stroke', { color: wbColor, size: wbSize, points: [p, [p[0]+0.01, p[1]+0.01]], tool: wbToolRef.current });
     }
   };
   const handleWbTouchStart = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    if (meetingEnded) return;
     const t = e.touches[0]; if (!t) return; e.preventDefault();
     const canvas = wbCanvasRef.current; if (!canvas) return;
     if (wbToolRef.current === 'fill') {
@@ -826,6 +1048,7 @@ export default function App() {
     wbPointsRef.current.push([x, y]);
   };
   const handleWbTouchMove = (e: React.TouchEvent<HTMLCanvasElement>) => {
+    if (meetingEnded) return;
     const t = e.touches[0]; if (!t || !wbDrawingRef.current) return; e.preventDefault();
     const canvas = wbCanvasRef.current; if (!canvas) return;
     const [x, y] = pointerToCanvasXY(canvas, t.clientX, t.clientY);
@@ -866,33 +1089,33 @@ export default function App() {
 
 
   return (
-    <div className="min-h-screen flex flex-col">
-      <header className="border-b bg-white/70 backdrop-blur">
+    <div className="min-h-screen flex flex-col bg-[#0A0A0A] text-[#F1F1F1]">
+      <header className="border-b border-[#2A2A2A] bg-[#3D2C8D]">
         <div className="container-page h-14 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="h-8 w-8 rounded-lg bg-indigo-600" />
-            <span className="font-semibold">Metaverse Collaboration</span>
+            <div className="h-8 w-8 rounded-lg bg-white/90 shadow-sm" />
+            <span className="font-semibold tracking-wide text-white">Metaverse Collaboration</span>
             {roomId && (
-              <span className="ml-2 text-xs px-2 py-1 rounded bg-indigo-50 text-indigo-700">
+              <span className="ml-2 text-xs px-2 py-1 rounded bg-[#3D2C8D] text-white">
                 Room: {roomId}
               </span>
             )}
           </div>
           <div className="flex items-center gap-2">
             <input
-              className="input w-44"
+              className="input w-44 bg-[#1E1E1E] text-[#F1F1F1] placeholder:text-[#A0A0A0] border border-[#2A2A2A]"
               placeholder="Your name"
               value={displayName}
               onChange={(e) => setDisplayName(e.target.value)}
             />
             <input
-              className="input w-44"
+              className="input w-44 bg-[#1E1E1E] text-[#F1F1F1] placeholder:text-[#A0A0A0] border border-[#2A2A2A]"
               placeholder="Room code"
               value={roomCodeInput}
               onChange={(e) => setRoomCodeInput(e.target.value)}
             />
             <button
-              className="btn-secondary"
+              className="btn-secondary hover:brightness-110 bg-[#3D2C8D] hover:bg-[#7A00FF] text-white"
               onClick={() => {
                 const code = roomCodeInput.trim();
                 if (code) setRoomId(code);
@@ -902,7 +1125,7 @@ export default function App() {
               Use Code
             </button>
             <button
-              className="btn-secondary"
+              className="btn-secondary hover:brightness-110 bg-[#3D2C8D] hover:bg-[#7A00FF] text-white"
               onClick={() => {
                 const code = "room-" + Math.random().toString(36).slice(2, 8);
                 setRoomId(code);
@@ -913,25 +1136,61 @@ export default function App() {
               Create Room
             </button>
             <button
-              className="btn-primary"
+              className="btn-secondary hover:brightness-110 bg-[#3D2C8D] hover:bg-[#7A00FF] text-white"
+              onClick={() => { loadMeetings(); setDashboardOpen(true); }}
+            >
+              Dashboard
+            </button>
+            <button
+              className="btn-primary shadow-sm hover:shadow-md bg-[#3D2C8D] hover:bg-[#7A00FF] text-white"
               onClick={async () => {
                 setErrorMsg(null);
                 try {
-                  if (!authedUser) { setAuthOpen(true); return; }
+                  // Ensure room code exists
+                  let code = roomId || roomCodeInput.trim();
+                  if (!code) {
+                    code = "room-" + Math.random().toString(36).slice(2, 8);
+                    setRoomId(code);
+                    setRoomCodeInput(code);
+                    sessionStorage.setItem('lastRoomId', code);
+                  }
+                  // Ensure an identity (guest if not authed)
+                  let user = authedUser;
+                  if (!user) {
+                    user = { id: userIdRef.current, name: displayName || `Guest-${Math.floor(Math.random()*1000)}`, email: "guest@local", avatar: { kind: 'image' as const, value: avatarImage } };
+                    setAuthedUser(user);
+                    sessionStorage.setItem('sessionAuthed', '1');
+                  }
                   if (!joined) {
-                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+                    // Try audio+video, then audio-only, then none
+                    let stream: MediaStream | null = null;
+                    try {
+                      stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+                      setMicEnabled(true);
+                      setCamEnabled(true);
+                    } catch {
+                      try {
+                        stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                        setMicEnabled(true);
+                        setCamEnabled(false);
+                      } catch {
+                        stream = null;
+                        setMicEnabled(false);
+                        setCamEnabled(false);
+                      }
+                    }
                     mediaStreamRef.current = stream;
-                    if (videoRef.current) {
+                    if (videoRef.current && stream) {
                       videoRef.current.srcObject = stream;
                       await videoRef.current.play().catch(() => {});
                     }
-                    setMicEnabled(true);
-                    setCamEnabled(true);
-                    setJoined(true);
-                    sessionStorage.setItem('sessionAuthed', '1');
-                    sessionStorage.setItem('joined', '1');
                     nameRef.current = displayName;
-                    const url = modelUrlForAvatar(authedUser.avatar.value);
+                    setMeetingEnded(false);
+                    setJoined(true);
+                    sessionStorage.setItem('joined', '1');
+                    // Ensure local avatar exists
+                    const selected = (user?.avatar?.value) || avatarImage;
+                    const url = modelUrlForAvatar(selected);
                     const { group: obj, clips } = await loadModel(url);
                     obj.traverse((o) => { (o as any).castShadow = true; });
                     localAvatarRef.current = obj;
@@ -946,6 +1205,8 @@ export default function App() {
                       const walkAct = walk ? localMixerRef.current.clipAction(walk) : undefined;
                       localActionsRef.current = { idle: idleAct, walk: walkAct, current: 'idle' };
                     }
+                    // After a user gesture, try resuming any remote audio
+                    setTimeout(() => { resumeAllRemoteAudio(); }, 300);
                   }
                 } catch (err: any) {
                   setErrorMsg(err?.message ?? "Failed to access media devices");
@@ -958,9 +1219,9 @@ export default function App() {
             {authedUser && (
               <div className="ml-2 inline-flex items-center gap-2 text-sm">
                 <img src={authedUser.avatar?.value || avatarGallery[0]} className="h-6 w-6 rounded-full object-cover" />
-                <span>{authedUser.name}</span>
-                <button className="btn-ghost" onClick={() => { sessionStorage.removeItem('sessionAuthed'); setSessionReady(false); setJoined(false); }}>Logout</button>
-                <button className="btn-ghost" onClick={() => { localStorage.removeItem('authUser'); sessionStorage.removeItem('sessionAuthed'); setAuthedUser(null); setSessionReady(false); setAuthMode('login'); }}>Switch</button>
+                <span className="text-white">{authedUser.name}</span>
+                <button className="btn-ghost text-white hover:bg-white/10" onClick={() => { sessionStorage.removeItem('sessionAuthed'); setSessionReady(false); setJoined(false); }}>Logout</button>
+                <button className="btn-ghost text-white hover:bg-white/10" onClick={() => { localStorage.removeItem('authUser'); sessionStorage.removeItem('sessionAuthed'); setAuthedUser(null); setSessionReady(false); setAuthMode('login'); }}>Switch</button>
               </div>
             )}
           </div>
@@ -969,16 +1230,16 @@ export default function App() {
 
       <main className="flex-1 grid grid-cols-12 gap-4 container-page py-4">
         <aside className="col-span-3 hidden md:block">
-          <div className="card">
+          <div className="card shadow-sm bg-[#1E1E1E] border border-[#2A2A2A]">
             <div className="card-body">
-              <h3>Roster</h3>
+              <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Roster</h3>
               {roster.length === 0 ? (
-                <p className="text-sm text-gray-600">Participants will appear here.</p>
+                <p className="text-sm text-[#A0A0A0]">Participants will appear here.</p>
               ) : (
                 <ul className="mt-2 space-y-1 text-sm">
                   <li key="self" className="text-indigo-700 flex items-center gap-2">
                     <img src={authedUser?.avatar?.value || avatarGallery[0]} className="h-4 w-4 rounded-full object-cover" />
-                    You: {displayName}
+                    You: {`${displayName}-${tabTagRef.current || ''}`}
                   </li>
                   {roster.map((m) => (
                     <li key={m.id} className="flex items-center gap-2">
@@ -990,32 +1251,33 @@ export default function App() {
               )}
             </div>
           </div>
-          <div className="card mt-4">
+          <div className="card mt-4 shadow-sm bg-[#1E1E1E] border border-[#2A2A2A]">
             <div className="card-body">
-              <h3>Tools</h3>
+              <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Tools</h3>
               <ul className="mt-2 space-y-2 text-sm">
                 <li>
-                  <button className="btn-secondary w-full" onClick={() => {
+                  <button className="btn-primary w-full shadow-sm hover:shadow bg-[#3D2C8D] hover:bg-[#7A00FF] text-white" disabled={meetingEnded} onClick={() => {
+                    if (meetingEnded) return;
                     setWbOpen((v)=>!v);
                     setTimeout(setupWhiteboardCanvas, 50);
                     if (socketRef.current) socketRef.current.emit('whiteboard:requestState');
                   }}>{wbOpen? 'Hide Whiteboard':'Open Whiteboard'}</button>
                 </li>
                 <li>
-                  <button className="btn-secondary w-full" onClick={() => setChatOpen((v)=>!v)}>{chatOpen? 'Hide Chat':'Open Chat'}</button>
+                  <button className="btn-primary w-full shadow-sm hover:shadow bg-[#3D2C8D] hover:bg-[#7A00FF] text-white" disabled={meetingEnded} onClick={() => { if (meetingEnded) return; setChatOpen((v)=>!v);} }>{chatOpen? 'Hide Chat':'Open Chat'}</button>
                 </li>
-                <li>Documents</li>
-                <li>Assets</li>
+                <li className="text-[#F1F1F1]">Documents</li>
+                <li className="text-[#F1F1F1]">Assets</li>
               </ul>
             </div>
           </div>
           {wbOpen && (
-            <div className="card mt-4">
+            <div className="card mt-4 shadow-sm bg-[#1E1E1E] border border-[#2A2A2A]">
               <div className="card-body">
                 <div className="flex items-center justify-between">
-                  <h3>Whiteboard</h3>
+                  <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Whiteboard</h3>
                   <div className="flex items-center gap-2">
-                    <select className="input" onChange={(e)=>{ wbToolRef.current = e.target.value as any; }}>
+                    <select className="input focus:ring-2 focus:ring-[#7A00FF] bg-[#1E1E1E] border border-[#2A2A2A] text-[#F1F1F1]" onChange={(e)=>{ wbToolRef.current = e.target.value as any; }}>
                       <option value="pencil">Pencil</option>
                       <option value="brush">Brush</option>
                       <option value="marker">Marker</option>
@@ -1023,15 +1285,15 @@ export default function App() {
                       <option value="eraser">Eraser</option>
                       <option value="fill">Fill</option>
                     </select>
-                    <input type="color" value={wbColor} onChange={(e)=>setWbColor(e.target.value)} />
-                    <input type="range" min={1} max={24} value={wbSize} onChange={(e)=>setWbSize(parseInt(e.target.value))} />
-                    <button className="btn-ghost" onClick={() => {
+                    <input type="color" value={wbColor} onChange={(e)=>setWbColor(e.target.value)} className="h-9 w-10 rounded" />
+                    <input type="range" min={1} max={24} value={wbSize} onChange={(e)=>setWbSize(parseInt(e.target.value))} className="accent-[#7A00FF]" />
+                    <button className="btn-ghost hover:bg-white/5" onClick={() => {
                       clearWhiteboardCanvas();
                       socketRef.current?.emit('whiteboard:clear');
-                    }}>Clear</button>
+                    }} disabled={meetingEnded}>Clear</button>
                   </div>
                 </div>
-                <div className="mt-2 border rounded-md overflow-hidden">
+                <div className="mt-2 border border-[#2A2A2A] rounded-md overflow-hidden">
                   <canvas ref={wbCanvasRef} className="w-full h-72 touch-none select-none bg-white" 
                     onMouseDown={(e)=>handleWbPointerDown(e)}
                     onMouseMove={(e)=>handleWbPointerMove(e)}
@@ -1039,22 +1301,23 @@ export default function App() {
                     onMouseLeave={()=>handleWbPointerUp()}
                     onTouchStart={(e)=>handleWbTouchStart(e)}
                     onTouchMove={(e)=>handleWbTouchMove(e)}
-                    onTouchEnd={()=>handleWbPointerUp()}
+                    onTouchEnd={()=>handleWbTouchEnd()}
                   />
                 </div>
-                <p className="text-xs text-gray-500 mt-2">Tip: choose color/size, draw together in real-time.</p>
+                <p className="text-xs text-[#A0A0A0] mt-2">Tip: choose color/size, draw together in real-time.</p>
               </div>
             </div>
           )}
         </aside>
 
         <section className="col-span-12 md:col-span-6">
-          <div className="card overflow-hidden">
+          <div className="card overflow-hidden shadow-sm bg-[#1E1E1E] border border-[#2A2A2A]">
             <div className="relative">
               <div
                 ref={mountRef}
                 className="h-[60vh] w-full"
                 onMouseMove={(e) => {
+                  if (meetingEnded) return;
                   if (!socketRef.current) return;
                   const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
                   const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -1071,6 +1334,7 @@ export default function App() {
                   socketRef.current.emit("cursor:pos", { userId: userIdRef.current, p: [point.x, 0.05, point.z] });
                 }}
                 onClick={(e) => {
+                  if (meetingEnded) return;
                   const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
                   const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
                   const y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
@@ -1093,34 +1357,37 @@ export default function App() {
           {errorMsg && (
             <p className="text-sm text-red-600 mt-1">{errorMsg}</p>
           )}
-          <div className="mt-4 card">
+          <div className="mt-4 card shadow-sm bg-[#1E1E1E] border border-[#2A2A2A]">
             <div className="card-body">
-              <h3>Participants Video</h3>
+              <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Participants Video</h3>
               <div className="mt-3 grid grid-cols-2 md:grid-cols-3 gap-3">
-                {camEnabled && mediaStreamRef.current && (
+                {!meetingEnded && camEnabled && mediaStreamRef.current && (
                   <div className="relative">
                     <video className="w-full aspect-video rounded-lg bg-black" muted playsInline autoPlay ref={(el: HTMLVideoElement | null) => { if (el && el.srcObject !== mediaStreamRef.current) el.srcObject = mediaStreamRef.current; }} />
                     <div className="absolute bottom-1 left-1 text-[10px] px-1.5 py-0.5 rounded bg-black/60 text-white">You</div>
                   </div>
                 )}
-                {(Object.entries(remoteStreamsRef.current) as [string, MediaStream][]).map(([peerId, stream]) => (
+                {!meetingEnded && (Object.entries(remoteStreamsRef.current) as [string, MediaStream][]).map(([peerId, stream]) => (
                   <div key={peerId} className="relative">
-                    <video className="w-full aspect-video rounded-lg bg-black" autoPlay playsInline ref={(el: HTMLVideoElement | null) => { if (el && el.srcObject !== stream) el.srcObject = stream; }} />
+                    <video className="w-full aspect-video rounded-lg bg-black" autoPlay playsInline ref={(el: HTMLVideoElement | null) => { if (el && el.srcObject !== stream) el.srcObject = stream; try { (el as any).muted = false; } catch {} }} />
                     <div className="absolute bottom-1 left-1 text-[10px] px-1.5 py-0.5 rounded bg-black/60 text-white">{nameForUserId(peerId)}</div>
                   </div>
                 ))}
+                {meetingEnded && (
+                  <div className="col-span-2 md:col-span-3 text-center text-sm text-[#A0A0A0] py-6 bg-[#121212] rounded-md border border-[#2A2A2A]">Meeting ended</div>
+                )}
               </div>
             </div>
           </div>
           {chatOpen && (
-            <div className="mt-4 card">
+            <div className="mt-4 card shadow-sm bg-[#1E1E1E] border border-[#2A2A2A]">
               <div className="card-body">
                 <div className="flex items-center justify-between">
-                  <h3>Chat</h3>
+                  <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Chat</h3>
                   <div className="flex items-center gap-2">
                     <label className="text-xs">Medical Mode</label>
                     <button
-                      className={`btn-secondary text-xs ${medMode ? 'bg-green-100' : ''}`}
+                      className={`btn-secondary text-xs ${medMode ? 'bg-[#2A2A2A] ring-1 ring-[#7A00FF]' : 'bg-[#2A2A2A]'} text-[#F1F1F1]`}
                       onClick={() => {
                         setMedMode((v)=>{
                           const next = !v;
@@ -1133,9 +1400,9 @@ export default function App() {
                     >{medMode ? 'ON' : 'OFF'}</button>
                   </div>
                 </div>
-                <div ref={chatListRef} className="mt-2 h-56 overflow-y-auto border rounded p-2 bg-white">
+                <div className="mt-2 border border-[#2A2A2A] rounded p-2 bg-[#111111]">
                   {chatLog.length === 0 ? (
-                    <p className="text-xs text-gray-500">No messages yet.</p>
+                    <p className="text-xs text-[#A0A0A0]">No messages yet.</p>
                   ) : (
                     <ul className="space-y-2 text-sm">
                       {chatLog.slice(-200).map((m,i)=> {
@@ -1145,10 +1412,10 @@ export default function App() {
                             {!isSelf && (
                               <img src={avatarForUserId(m.userId)} className="h-6 w-6 rounded-full object-cover mr-2" />
                             )}
-                            <div className={`${isSelf ? 'bg-indigo-600 text-white' : 'bg-gray-100 text-gray-900'} rounded-2xl px-3 py-2 max-w-[75%] shadow-sm`}> 
-                              {!isSelf && <div className="text-[10px] opacity-80 mb-0.5">{nameForUserId(m.userId)}</div>}
+                            <div className={`${isSelf ? 'bg-[#3D2C8D] text-white' : 'bg-[#2A2A2A] text-[#F1F1F1]'} rounded-2xl px-3 py-2 max-w-[75%] shadow-sm`}> 
+                              {!isSelf && <div className="text-[10px] text-[#A0A0A0] mb-0.5">{nameForUserId(m.userId)}</div>}
                               <div className="whitespace-pre-wrap break-words">{m.text}</div>
-                              <div className={`text-[10px] mt-0.5 ${isSelf ? 'text-indigo-100/90' : 'text-gray-500'}`}>{formatTime(m.ts)}</div>
+                              <div className={`text-[10px] mt-0.5 ${isSelf ? 'text-white/70' : 'text-[#A0A0A0]'}`}>{formatTime(m.ts)}</div>
                             </div>
                             {isSelf && (
                               <img src={avatarForUserId(m.userId)} className="h-6 w-6 rounded-full object-cover ml-2" />
@@ -1161,11 +1428,13 @@ export default function App() {
                 </div>
                 <div className="mt-2 flex gap-2">
                   <input
-                    className="input flex-1"
+                    className="input flex-1 bg-[#1E1E1E] text-[#F1F1F1] placeholder:text-[#A0A0A0] border border-[#2A2A2A]"
                     placeholder="Type a message"
                     value={chatInput}
-                    onChange={(e)=>setChatInput(e.target.value)}
+                    onChange={(e)=>{ if (meetingEnded) return; setChatInput(e.target.value);} }
+                    disabled={meetingEnded}
                     onKeyDown={(e)=>{
+                      if(meetingEnded) return;
                       if(e.key==='Enter') {
                         const raw = chatInput.trim();
                         if (!raw) return;
@@ -1179,8 +1448,9 @@ export default function App() {
                     }}
                   />
                   <button
-                    className="btn-primary"
+                    className="btn-primary shadow-sm hover:shadow bg-[#3D2C8D] hover:bg-[#7A00FF]"
                     onClick={()=>{
+                      if (meetingEnded) return;
                       const raw = chatInput.trim();
                       if (!raw) return;
                       const text = medMode ? `[MED] ${raw}` : raw;
@@ -1190,6 +1460,7 @@ export default function App() {
                       socketRef.current?.emit('chat:message', { text, cid });
                       setChatInput('');
                     }}
+                    disabled={meetingEnded}
                   >Send</button>
                 </div>
               </div>
@@ -1198,111 +1469,198 @@ export default function App() {
         </section>
 
         <aside className="col-span-12 md:col-span-3">
-          <div className="card">
+          {/* Timeline with End Meeting */}
+          <div className="card shadow-sm bg-[#1E1E1E] border border-[#2A2A2A]">
             <div className="card-body">
-              <h3>Timeline</h3>
-              <p className="text-sm text-gray-600">Meeting summary (after End Meeting).</p>
+              <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Timeline</h3>
+              <p className="text-sm text-[#A0A0A0]">Meeting summary (after End Meeting).</p>
               {summaries.length === 0 ? (
-                <p className="text-xs text-gray-500 mt-2">No summary yet.</p>
+                <p className="text-xs text-[#A0A0A0] mt-2">No summary yet.</p>
               ) : (
                 <ul className="mt-2 space-y-1 text-xs">
-                  {summaries.slice(-6).map((s, i) => (<li key={i} className="text-gray-700">• {s}</li>))}
+                  {summaries.slice(-6).map((s, i) => (<li key={i} className="text-[#F1F1F1]">• {s}</li>))}
                 </ul>
               )}
               <div className="mt-3 flex gap-2">
-                <button className="btn-primary w-full" onClick={() => {
-                  // End meeting: stop recognition loop and generate a simple summary from chat + transcript
+                <button className="btn-primary w-full shadow-sm hover:shadow bg-[#3D2C8D] hover:bg-[#7A00FF]" onClick={async () => {
                   setMeetingEnded(true);
-                  const chatSummary = chatLog.slice(-50).map(m=>`${m.name}: ${m.text}`).join(' ');
-                  const text = (transcript ? transcript + ' ' : '') + chatSummary;
-                  const sentences = text.split(/[.!?]+\s/).filter(Boolean);
-                  const bullets = sentences.slice(-6).map(s=>`Recent: ${s.trim()}`);
+                  const full = (transcriptRef.current || transcript || '').trim();
+                  const bullets = buildSummary(full, chatLog);
                   setSummaries(bullets);
+                  const whiteboardImage = (() => { const c = wbCanvasRef.current; try { return c ? c.toDataURL('image/png') : undefined; } catch { return undefined; } })();
+                  try { recognitionRef.current?.stop?.(); } catch {}
+                  if (mediaStreamRef.current) {
+                    try { await replaceVideoTrackForAll(null); } catch {}
+                    try { await replaceAudioTrackForAll(null); } catch {}
+                    mediaStreamRef.current.getTracks().forEach(t=>{ try { t.stop(); } catch {} });
+                    mediaStreamRef.current = null;
+                  }
+                  setCamEnabled(false); setMicEnabled(false);
+                  saveMeeting({ summary: bullets, transcript: (transcriptRef.current || transcript || '').trim(), whiteboardImage });
+                  sessionStorage.setItem('joined', '0');
+                  setJoined(false);
                 }}>End Meeting</button>
               </div>
             </div>
           </div>
-          <div className="card mt-4">
+          <div className="card mt-4 shadow-sm bg-[#1E1E1E] border border-[#2A2A2A]">
             <div className="card-body">
-              <h3>Settings</h3>
+              <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Settings</h3>
               <div className="mt-2 space-y-2">
                 <button
-                  className="btn-secondary w-full"
+                  className={`${micEnabled ? 'bg-[#7A00FF] text-white hover:bg-[#6a00e6]' : 'bg-[#2A2A2A] text-[#F1F1F1] hover:bg-[#333333]'} w-full rounded-md px-3 py-2 transition-colors disabled:bg-[#2A2A2A] disabled:text-[#F1F1F1] disabled:opacity-60 disabled:cursor-not-allowed`}
+                  disabled={meetingEnded || micBusy}
                   onClick={async () => {
-                    await ensureMediaIfNeeded();
-                    const st = mediaStreamRef.current;
-                    if (!st) return;
-                    const a = st.getAudioTracks()[0];
-                    if (a) {
+                    if (meetingEnded || micBusy) return;
+                    setMicBusy(true);
+                    try {
+                      await ensureMediaIfNeeded();
+                      let st = mediaStreamRef.current;
+                      if (!st) {
+                        try {
+                          st = await navigator.mediaDevices.getUserMedia({ audio: true });
+                          mediaStreamRef.current = st;
+                        } catch { setErrorMsg('Cannot access microphone'); return; }
+                      }
+                      let a = st.getAudioTracks()[0];
+                      if (!a) {
+                        try {
+                          const anew = (await navigator.mediaDevices.getUserMedia({ audio: true })).getAudioTracks()[0];
+                          st.addTrack(anew);
+                          a = anew;
+                        } catch { setErrorMsg('Cannot start microphone'); return; }
+                      }
                       if (a.enabled) {
-                        // turn OFF: stop sending and mute monitor
                         await replaceAudioTrackForAll(null);
                         a.enabled = false;
                         if (micMonitorRef.current) micMonitorRef.current.gain.gain.value = 0.0;
+                        if (micLevelRafRef.current) { cancelAnimationFrame(micLevelRafRef.current); micLevelRafRef.current = null; }
+                        setMicLevel(0);
                         setMicEnabled(false);
                       } else {
-                        // turn ON: ensure track exists and send; enable monitor
                         if (a.readyState === 'ended') {
                           try {
                             const anew = (await navigator.mediaDevices.getUserMedia({ audio: true })).getAudioTracks()[0];
                             st.addTrack(anew);
                             await replaceAudioTrackForAll(anew);
+                            a = anew;
                           } catch { setErrorMsg('Cannot start microphone'); return; }
                         } else {
                           await replaceAudioTrackForAll(a);
                         }
                         a.enabled = true;
-                        if (!audioCtxRef.current) audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-                        if (micMonitorRef.current) micMonitorRef.current.gain.gain.value = 0.6;
+                        try {
+                          if (!audioCtxRef.current || (audioCtxRef.current as any).state === 'closed') {
+                            audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+                          }
+                          if (audioCtxRef.current.state !== 'running') await audioCtxRef.current.resume();
+                          if (!micMonitorRef.current) {
+                            try {
+                              const src = audioCtxRef.current.createMediaStreamSource(st);
+                              const gain = audioCtxRef.current.createGain();
+                              gain.gain.value = 0.0;
+                              src.connect(gain).connect(audioCtxRef.current.destination);
+                              micMonitorRef.current = { source: src, gain };
+                            } catch {}
+                          }
+                          // ensure analyser exists and loop runs
+                          if (!micAnalyserRef.current) {
+                            try {
+                              const analyser = audioCtxRef.current.createAnalyser();
+                              analyser.fftSize = 256; micAnalyserRef.current = analyser;
+                              micMonitorRef.current?.source.connect(analyser);
+                            } catch {}
+                          }
+                          if (!micLevelRafRef.current && micAnalyserRef.current) {
+                            const analyser = micAnalyserRef.current; const data = new Uint8Array(analyser.frequencyBinCount);
+                            const loop = () => {
+                              try { analyser.getByteTimeDomainData(data); } catch {}
+                              let sum = 0; for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v*v; }
+                              const rms = Math.sqrt(sum / data.length);
+                              setMicLevel(Math.min(1, rms * 2));
+                              micLevelRafRef.current = requestAnimationFrame(loop);
+                            };
+                            micLevelRafRef.current = requestAnimationFrame(loop);
+                          }
+                        } catch {}
+                        if (micMonitorRef.current) micMonitorRef.current.gain.gain.value = 1.0;
                         setMicEnabled(true);
+                        // ensure remote audio resumes after user gesture
+                        resumeAllRemoteAudio();
                       }
+                    } finally {
+                      setMicBusy(false);
                     }
                   }}
                 >
                   {micEnabled ? "Mute Mic" : "Unmute Mic"}
                 </button>
                 <button
-                  className="btn-secondary w-full"
+                  className={`${camEnabled ? 'bg-[#7A00FF] text-white hover:bg-[#6a00e6]' : 'bg-[#2A2A2A] text-[#F1F1F1] hover:bg-[#333333]'} w-full rounded-md px-3 py-2 transition-colors disabled:bg-[#2A2A2A] disabled:text-[#F1F1F1] disabled:opacity-60 disabled:cursor-not-allowed`}
+                  disabled={meetingEnded || camBusy}
                   onClick={async () => {
-                    await ensureMediaIfNeeded();
-                    const st = mediaStreamRef.current;
-                    if (!st) return;
-                    const vtrack = st.getVideoTracks()[0];
-                    if (camEnabled && vtrack) {
-                      await replaceVideoTrackForAll(null);
-                      vtrack.stop();
-                      st.removeTrack(vtrack);
-                      setCamEnabled(false);
-                      if (videoRef.current) videoRef.current.srcObject = st;
-                    } else if (!camEnabled) {
-                      try {
-                        const v = await navigator.mediaDevices.getUserMedia({ video: true });
-                        const newTrack = v.getVideoTracks()[0];
-                        st.addTrack(newTrack);
-                        await replaceVideoTrackForAll(newTrack);
+                    if (meetingEnded || camBusy) return;
+                    setCamBusy(true);
+                    try {
+                      await ensureMediaIfNeeded();
+                      let st = mediaStreamRef.current;
+                      if (!st) {
+                        try {
+                          st = await navigator.mediaDevices.getUserMedia({ video: true });
+                          mediaStreamRef.current = st;
+                        } catch { setErrorMsg('Cannot access camera'); return; }
+                      }
+                      let vtrack = st.getVideoTracks()[0];
+                      if (camEnabled && vtrack) {
+                        await replaceVideoTrackForAll(null);
+                        vtrack.stop();
+                        st.removeTrack(vtrack);
+                        setCamEnabled(false);
                         if (videoRef.current) videoRef.current.srcObject = st;
-                        setCamEnabled(true);
-                      } catch { setErrorMsg('Cannot start camera'); }
+                      } else if (!camEnabled) {
+                        try {
+                          if (!vtrack || vtrack.readyState === 'ended') {
+                            const v = await navigator.mediaDevices.getUserMedia({ video: true });
+                            const newTrack = v.getVideoTracks()[0];
+                            st.addTrack(newTrack);
+                            await replaceVideoTrackForAll(newTrack);
+                          } else {
+                            await replaceVideoTrackForAll(vtrack);
+                          }
+                          if (videoRef.current) videoRef.current.srcObject = st;
+                          setCamEnabled(true);
+                          // ensure remote audio resumes after user gesture
+                          resumeAllRemoteAudio();
+                        } catch { setErrorMsg('Cannot start camera'); }
+                      }
+                    } finally {
+                      setCamBusy(false);
                     }
                   }}
                 >
                   {camEnabled ? "Turn Camera Off" : "Turn Camera On"}
                 </button>
-                <div className="mt-2 h-40 bg-gray-900/90 rounded-md flex items-center justify-center">
+                <div className="mt-2">
+                  <div className="text-xs text-[#A0A0A0] mb-1">Mic Level</div>
+                  <div className="h-2 w-full rounded bg-[#2A2A2A] overflow-hidden">
+                    <div className="h-full bg-[#7A00FF] transition-[width] duration-100" style={{ width: `${Math.round(micLevel*100)}%` }} />
+                  </div>
+                </div>
+                <div className="mt-2 h-40 bg-[#111111] rounded-md flex items-center justify-center ring-1 ring-[#2A2A2A]">
                   <video ref={videoRef} className="h-full" muted playsInline autoPlay />
                 </div>
                 <div className="mt-3">
                   <div className="text-sm mb-1">Quick Avatar</div>
                   <div className="grid grid-cols-5 gap-2">
                     {avatarGallery.map((src) => (
-                      <button key={src} className={`rounded-lg p-1 ring-2 ${avatarImage===src? 'ring-indigo-500':'ring-transparent'} bg-gray-100`} onClick={() => setAvatarImage(src)}>
+                      <button key={src} className={`rounded-lg p-1 ring-2 ${avatarImage===src? 'ring-[#7A00FF] shadow-sm':'ring-transparent'} bg-[#2A2A2A] hover:bg-[#333333]`} onClick={() => setAvatarImage(src)}>
                         <img src={src} className="h-12 w-12 rounded-md object-cover" />
                       </button>
                     ))}
                   </div>
                   <div className="flex items-center justify-end gap-2 mt-2">
-                    <button className="btn-secondary" onClick={() => setAvatarImage(avatarGallery[0])}>Reset</button>
-                    <button className="btn-primary" onClick={async () => {
+                    <button className="btn-secondary hover:brightness-110 bg-[#2A2A2A] text-[#F1F1F1]" onClick={() => setAvatarImage(avatarGallery[0])}>Reset</button>
+                    <button className="btn-primary shadow-sm hover:shadow bg-[#3D2C8D] hover:bg-[#7A00FF]" onClick={async () => {
                       if (!authedUser) return;
                       const updated = { ...authedUser, avatar: { kind: 'image' as const, value: avatarImage } };
                       setAuthedUser(updated);
@@ -1332,11 +1690,71 @@ export default function App() {
               </div>
             </div>
           </div>
+          {/* Transcript Preview (below Settings) */}
+          <div className="card mt-4 shadow-sm bg-[#1E1E1E] border border-[#2A2A2A]">
+            <div className="card-body">
+              <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Transcript Preview</h3>
+              <div className="mt-2 h-40 overflow-y-auto border border-[#2A2A2A] rounded p-2 bg-[#111111] text-sm whitespace-pre-wrap text-[#F1F1F1]">
+                {transcript?.trim() ? transcript : 'Speak to start capturing transcript...'}
+              </div>
+              <div className="mt-2 flex items-center justify-between">
+                <div className="text-xs text-[#A0A0A0]">
+                  {sttStatus === 'unsupported' && 'Speech Recognition not supported in this browser.'}
+                  {sttStatus === 'not_joined' && 'Join a room to start transcription.'}
+                  {sttStatus === 'idle' && 'Click Start if transcript does not begin automatically.'}
+                  {sttStatus === 'running' && 'Listening… speak to transcribe.'}
+                  {sttStatus === 'stopped' && 'Transcription stopped. Press Start to resume.'}
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    className="btn-secondary bg-[#2A2A2A] text-[#F1F1F1] hover:bg-[#333333] disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled={sttStatus === 'unsupported' || !joined || meetingEnded}
+                    aria-disabled={sttStatus === 'unsupported' || !joined || meetingEnded}
+                    onClick={() => startRecognition()}
+                  >Start</button>
+                  <button
+                    className="btn-ghost hover:bg-white/5 disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled={sttStatus !== 'running'}
+                    aria-disabled={sttStatus !== 'running'}
+                    onClick={() => { sttManualStopRef.current = true; setSttStatus('stopped'); try { recognitionRef.current?.stop?.(); } catch {} }}
+                  >Stop</button>
+                  <button
+                    className="btn-ghost hover:bg-white/5 disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled={!transcript?.trim()}
+                    aria-disabled={!transcript?.trim()}
+                    onClick={() => { transcriptRef.current = ''; setTranscript(''); }}
+                  >Clear</button>
+                  <button
+                    className="btn-ghost hover:bg-white/5 disabled:opacity-50 disabled:cursor-not-allowed"
+                    disabled={!transcript?.trim()}
+                    aria-disabled={!transcript?.trim()}
+                    onClick={() => {
+                      const title = `Transcript_${roomId || 'room'}_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}`;
+                      const text = [
+                        `Title: ${title}`,
+                        `When: ${new Date().toLocaleString()}`,
+                        `Room: ${roomId || '-'}`,
+                        '',
+                        'Transcript:',
+                        (transcriptRef.current || transcript || '').trim() || '(empty)'
+                      ].join('\n');
+                      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url; a.download = `${title}.txt`;
+                      a.click(); URL.revokeObjectURL(url);
+                    }}
+                  >Save</button>
+                  <button className="btn-ghost hover:bg-white/5" onClick={() => { navigator.clipboard?.writeText(transcript || ''); }}>Copy</button>
+                </div>
+              </div>
+            </div>
+          </div>
         </aside>
       </main>
 
-      <footer className="border-t">
-        <div className="container-page h-12 flex items-center justify-between text-sm text-gray-500">
+      <footer className="border-t border-[#2A2A2A] bg-[#0A0A0A]">
+        <div className="container-page h-12 flex items-center justify-between text-sm text-[#A0A0A0]">
           <span>Three.js + WebXR scaffold</span>
           <span>Vite + React + Tailwind</span>
         </div>
@@ -1344,36 +1762,36 @@ export default function App() {
 
       {!sessionReady && (
         <div className="fixed inset-0 flex items-center justify-center p-0">
-          <div className="absolute inset-0 bg-gradient-to-br from-indigo-600 via-cyan-500 to-sky-400" />
+          <div className="absolute inset-0 bg-gradient-to-br from-[#3D2C8D] via-[#5B3FD9] to-[#7A00FF] opacity-80" />
           <div className="relative w-full max-w-md mx-auto">
-            <div className="card rounded-2xl shadow-2xl backdrop-blur bg-white/95">
+            <div className="card rounded-2xl shadow-2xl backdrop-blur bg-[#1E1E1E] border border-[#2A2A2A]">
               <div className="card-body">
                 <div className="flex items-center justify-between">
-                  <h3 className="text-2xl font-bold tracking-tight text-gray-900">{authMode === 'login' ? 'Login' : 'Sign Up'}</h3>
+                  <h3 className="text-2xl font-bold tracking-tight">{authMode === 'login' ? 'Login' : 'Sign Up'}</h3>
                   <div className="text-sm">
                     {authMode === 'login' ? (
-                      <button className="btn-ghost" onClick={() => setAuthMode('signup')}>Create account</button>
+                      <button className="btn-ghost hover:bg-white/5" onClick={() => setAuthMode('signup')}>Create account</button>
                     ) : (
-                      <button className="btn-ghost" onClick={() => setAuthMode('login')}>Have an account? Login</button>
+                      <button className="btn-ghost hover:bg-white/5" onClick={() => setAuthMode('login')}>Have an account? Login</button>
                     )}
                   </div>
                 </div>
                 <div className="mt-4 space-y-3">
-                  <input className="input focus:ring-2 focus:ring-indigo-400 focus:border-indigo-400" placeholder="Email" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} />
-                  <input className="input focus:ring-2 focus:ring-indigo-400 focus:border-indigo-400" placeholder="Password" type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} />
-                  <input className="input focus:ring-2 focus:ring-indigo-400 focus:border-indigo-400" placeholder="Display name" value={authName} onChange={(e) => setAuthName(e.target.value)} />
+                  <input className="input bg-[#0F0F0F] border border-[#2A2A2A] text-[#F1F1F1] placeholder:text-[#A0A0A0] focus:ring-2 focus:ring-[#7A00FF] focus:border-[#7A00FF]" placeholder="Email" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} />
+                  <input className="input bg-[#0F0F0F] border border-[#2A2A2A] text-[#F1F1F1] placeholder:text-[#A0A0A0] focus:ring-2 focus:ring-[#7A00FF] focus:border-[#7A00FF]" placeholder="Password" type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} />
+                  <input className="input bg-[#0F0F0F] border border-[#2A2A2A] text-[#F1F1F1] placeholder:text-[#A0A0A0] focus:ring-2 focus:ring-[#7A00FF] focus:border-[#7A00FF]" placeholder="Display name" value={authName} onChange={(e) => setAuthName(e.target.value)} />
                   <div>
-                    <div className="text-sm mb-1 text-gray-700">Choose avatar</div>
+                    <div className="text-sm mb-1 text-[#A0A0A0]">Choose avatar</div>
                     <div className="grid grid-cols-5 gap-2">
                       {avatarGallery.map((src) => (
-                        <button key={src} className={`rounded-lg p-1 ring-2 transition-all ${avatarImage===src? 'ring-indigo-500 shadow-md':'ring-transparent'} bg-gray-100 hover:bg-gray-200`} onClick={() => setAvatarImage(src)}>
+                        <button key={src} className={`rounded-lg p-1 ring-2 transition-all ${avatarImage===src? 'ring-[#7A00FF] shadow-md':'ring-transparent'} bg-[#2A2A2A] hover:bg-[#333333]`} onClick={() => setAvatarImage(src)}>
                           <img src={src} className="h-12 w-12 rounded-md object-cover" />
                         </button>
                       ))}
                     </div>
                   </div>
                   {authMode === 'signup' && (
-                    <button className="btn-primary w-full" onClick={() => {
+                    <button className="btn-primary w-full shadow-sm hover:shadow bg-[#3D2C8D] hover:bg-[#7A00FF]" onClick={() => {
                       const accounts = JSON.parse(localStorage.getItem('accounts') || '[]');
                       const exists = accounts.find((a: any) => a.email === authEmail);
                       if (exists) { setErrorMsg('Account already exists'); return; }
@@ -1385,7 +1803,7 @@ export default function App() {
                     }}>Create Account</button>
                   )}
                   {authMode === 'login' && (
-                    <button className="btn-primary w-full" onClick={() => {
+                    <button className="btn-primary w-full shadow-sm hover:shadow bg-[#3D2C8D] hover:bg-[#7A00FF]" onClick={() => {
                       const accounts = JSON.parse(localStorage.getItem('accounts') || '[]');
                       const found = accounts.find((a: any) => a.email === authEmail && a.password === authPassword);
                       if (!found) { setErrorMsg('Invalid credentials'); return; }
@@ -1401,8 +1819,88 @@ export default function App() {
                       setErrorMsg(null);
                     }}>Login</button>
                   )}
-                  {errorMsg && <div className="text-sm text-red-600">{errorMsg}</div>}
+                  {errorMsg && <div className="text-sm text-red-400">{errorMsg}</div>}
                 </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {dashboardOpen && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setDashboardOpen(false)} />
+          <div className="relative w-full max-w-4xl mx-auto">
+            <div className="card rounded-2xl shadow-2xl backdrop-blur bg-[#1E1E1E] border border-[#2A2A2A]">
+              <div className="card-body">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xl font-semibold text-[#F1F1F1]">Meeting Dashboard</h3>
+                  <button className="btn-ghost hover:bg-white/5" onClick={() => setDashboardOpen(false)}>Close</button>
+                </div>
+                {meetings.length === 0 ? (
+                  <p className="text-sm text-[#A0A0A0] mt-2">No past meetings yet.</p>
+                ) : (
+                  <div className="mt-3 space-y-3 max-h-[70vh] overflow-y-auto">
+                    {meetings.slice().reverse().map((m) => (
+                      <div key={m.id} className="border border-[#2A2A2A] rounded-lg p-3 bg-[#111111] shadow-sm">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div>
+                            <div className="font-medium">{m.title}</div>
+                            <div className="text-xs text-[#A0A0A0]">{new Date(m.ts).toLocaleString()} · Room {m.roomId || '-'}</div>
+                            <div className="text-xs text-[#A0A0A0]">Participants: {m.participants.map(p=>p.name).join(', ') || '—'}</div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              className="btn-secondary hover:brightness-110 bg-[#3D2C8D] hover:bg-[#7A00FF] text-white"
+                              onClick={() => {
+                                const text = [
+                                  `Title: ${m.title}`,
+                                  `When: ${new Date(m.ts).toLocaleString()}`,
+                                  `Room: ${m.roomId || '-'}`,
+                                  `Participants: ${m.participants.map(p=>p.name).join(', ')}`,
+                                  '',
+                                  'Summary:',
+                                  ...(m.summary||[]).map(s=>`- ${s}`),
+                                  '',
+                                  'Transcript:',
+                                  m.transcript || '(empty)'
+                                ].join('\n');
+                                const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+                                const url = URL.createObjectURL(blob);
+                                const a = document.createElement('a');
+                                a.href = url; a.download = `${m.title.replace(/[^a-z0-9_\- ]/gi,'_')}.txt`;
+                                a.click(); URL.revokeObjectURL(url);
+                              }}
+                            >Download Notes</button>
+                            {m.whiteboardImage && (
+                              <a className="btn-secondary hover:brightness-110 bg-[#3D2C8D] hover:bg-[#7A00FF] text-white" href={m.whiteboardImage} download={`whiteboard_${m.id}.png`}>Download Whiteboard</a>
+                            )}
+                          </div>
+                        </div>
+                        {(() => {
+                          const display = (m.summary && m.summary.length > 0)
+                            ? m.summary
+                            : buildSummary(m.transcript || '', m.chat || []);
+                          return display && display.length > 0 ? (
+                            <ul className="mt-2 list-disc list-inside text-sm text-[#F1F1F1]">
+                              {display.slice(-6).map((s,i)=>(<li key={i}>{s}</li>))}
+                            </ul>
+                          ) : null;
+                        })()}
+                        {m.chat && m.chat.length>0 && (
+                          <div className="mt-2 text-xs text-[#A0A0A0]">
+                            Recent chat: {m.chat.slice(-5).map(c=>c.name+': '+c.text).join(' · ')}
+                          </div>
+                        )}
+                        {m.whiteboardImage && (
+                          <div className="mt-2">
+                            <img src={m.whiteboardImage} alt="Whiteboard snapshot" className="max-h-48 rounded border border-[#2A2A2A]" />
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -1417,7 +1915,3 @@ function getCanvasCtx(canvas: HTMLCanvasElement | null): CanvasRenderingContext2
   if (!canvas) return null;
   return canvas.getContext('2d');
 }
-
-// Speech recognition for simple transcript and summary
-// Hook it to micEnabled changes
-// Note: This must be inside component; append below export default function content if needed.
