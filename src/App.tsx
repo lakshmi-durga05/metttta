@@ -67,9 +67,16 @@ export default function App() {
   const lastEmitRef = useRef<number>(0);
   const moveTargetRef = useRef<THREE.Vector3 | null>(null);
   const micMonitorRef = useRef<{ source: MediaStreamAudioSourceNode; gain: GainNode } | null>(null);
+  const dgMediaRecRef = useRef<MediaRecorder | null>(null);
+  const dgStreamingRef = useRef<boolean>(false);
+  const [dgActive, setDgActive] = useState<boolean>(false);
   const [transcript, setTranscript] = useState<string>("");
   const transcriptRef = useRef<string>("");
+  const [interimText, setInterimText] = useState<string>("");
+  const [sttWarn, setSttWarn] = useState<boolean>(false);
+  const [sttWarnMsg, setSttWarnMsg] = useState<string>("");
   const [summaries, setSummaries] = useState<string[]>([]);
+  const [monitorOn, setMonitorOn] = useState<boolean>(false);
   const [chatOpen, setChatOpen] = useState<boolean>(true);
   const [chatInput, setChatInput] = useState<string>("");
   const [chatLog, setChatLog] = useState<Array<{userId:string; name:string; text:string; ts:number}>>([]);
@@ -83,6 +90,8 @@ export default function App() {
   const chatSeenRef = useRef<Set<string>>(new Set());
   const chatListRef = useRef<HTMLDivElement | null>(null);
   const [dashboardOpen, setDashboardOpen] = useState<boolean>(false);
+  const [copied, setCopied] = useState<boolean>(false);
+  const [pasted, setPasted] = useState<boolean>(false);
   // Collaborative doc + AI summary
   const [docOpen, setDocOpen] = useState<boolean>(false);
   const [docText, setDocText] = useState<string>("");
@@ -96,10 +105,12 @@ export default function App() {
   const [sttAvailable, setSttAvailable] = useState<boolean>(true);
   const sttManualStopRef = useRef<boolean>(false);
   const [sttStatus, setSttStatus] = useState<'idle'|'running'|'stopped'|'unsupported'|'not_joined'>('idle');
+  const [sttLang, setSttLang] = useState<string>((navigator.language || 'en-US'));
   const [oauthBusy, setOauthBusy] = useState<boolean>(false);
   const [onboardingOpen, setOnboardingOpen] = useState<boolean>(false);
   const [mounted, setMounted] = useState<boolean>(false);
   const [avatarIdx, setAvatarIdx] = useState<number>(0);
+  const USE_BROWSER_SR = false;
   const animatedAvatars: string[] = [
     '/avatars/avatar1.jpg',
     '/avatars/avatar2.jpg',
@@ -117,7 +128,7 @@ export default function App() {
     'https://media.giphy.com/media/3o7aD0p7Yh7W5b7zI8/giphy.gif',
     'https://media.giphy.com/media/l0Exk8EUzSLsrErEQ/giphy.gif'
   ];
-
+     
   // Convert a URL to a proxied direct image if possible
   const toImageSrc = (u: string): string => {
     try {
@@ -135,12 +146,60 @@ export default function App() {
       return u;
     }
   };
+
+  // Deterministic small hash for per-user avatar selection and spawn angle
+  const hashId = (s: string): number => {
+    let h = 0; for (let i = 0; i < s.length; i++) { h = (h * 31 + s.charCodeAt(i)) | 0; }
+    return Math.abs(h);
+  };
+
+  useEffect(()=>{ if (joined) { refreshMicDevices(); } }, [joined]);
+
+  // Motion tracking: declare before any usage in effects
+  const [motionTracking, setMotionTracking] = useState<boolean>(false);
+  const mousePosRef = useRef<{x:number;y:number}>({ x: 0.5, y: 0.5 });
+
+  // Track mouse for simple head-orientation when motionTracking is enabled
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const w = window.innerWidth || 1; const h = window.innerHeight || 1;
+      mousePosRef.current = { x: Math.max(0, Math.min(1, e.clientX / w)), y: Math.max(0, Math.min(1, e.clientY / h)) };
+    };
+    window.addEventListener('mousemove', onMove);
+    return () => window.removeEventListener('mousemove', onMove);
+  }, []);
   // Focus the 3D scene and attach tracks as soon as we're joined
   useEffect(() => {
     if (!joined) return;
     setTimeout(() => { try { mountRef.current?.focus(); } catch {} }, 50);
     (async () => { try { await attachLocalTracksToAllPeers(); } catch {} })();
   }, [joined]);
+
+  // Ensure audio context is resumed on user interaction (Chrome autoplay policy)
+  useEffect(() => {
+    const kickAudio = async () => {
+      try {
+        if (!audioCtxRef.current || (audioCtxRef.current as any).state === 'closed') {
+          audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        }
+        if (audioCtxRef.current.state !== 'running') {
+          await audioCtxRef.current.resume();
+        }
+        // Start Deepgram streaming if not already
+        if (joined && !dgStreamingRef.current) {
+          try { await startDeepgramStreaming(); } catch {}
+        }
+      } catch {}
+    };
+    window.addEventListener('pointerdown', kickAudio);
+    window.addEventListener('keydown', kickAudio);
+    return () => {
+      window.removeEventListener('pointerdown', kickAudio);
+      window.removeEventListener('keydown', kickAudio);
+    };
+  }, [joined]);
+
+  // Motion tracking state declared above
 
   // Movement + animation loop: move local avatar toward target and update mixers
   useEffect(() => {
@@ -194,12 +253,34 @@ export default function App() {
           const m = mixers[k];
           try { m.update?.(dt); } catch {}
         }
+        // Lightweight motion tracking: head yaw via cursor, bob via mic level
+        if (motionTracking && localAvatarRef.current) {
+          try {
+            const av = localAvatarRef.current as THREE.Object3D;
+            // Find head bone once and cache on the object
+            let head: any = (av as any).__headBone;
+            if (!head) {
+              av.traverse((n:any)=>{
+                const name = (n.name||'').toLowerCase();
+                if (!head && (name.includes('head') || name.includes('neck'))) head = n;
+              });
+              (av as any).__headBone = head || av;
+            }
+            const target = mousePosRef.current;
+            const yaw = (target.x - 0.5) * 0.6; // left/right
+            const bob = Math.min(0.25, Math.max(0, (micLevel || 0) * 0.25)); // up/down from mic level
+            const curY = head.rotation.y || 0;
+            const curX = head.rotation.x || 0;
+            head.rotation.y = curY + (yaw - curY) * Math.min(1, 8 * dt);
+            head.rotation.x = curX + ((-bob) - curX) * Math.min(1, 6 * dt);
+          } catch {}
+        }
       } catch {}
       requestAnimationFrame(loop);
     };
     const id = requestAnimationFrame(loop);
     return () => { stop = true; cancelAnimationFrame(id); };
-  }, [joined, meetingEnded]);
+  }, [joined, meetingEnded, motionTracking]);
 
   // If peers already exist, add local tracks to all of them (for pre-warmed media)
   const attachLocalTracksToAllPeers = async () => {
@@ -221,8 +302,10 @@ export default function App() {
       }
       if (added) {
         try {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
+          if (pc.signalingState === 'stable') {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+          }
           socketRef.current?.emit('webrtc:signal', { to: pid, from: userIdRef.current, data: pc.localDescription });
         } catch {}
       }
@@ -415,6 +498,7 @@ export default function App() {
   };
   const startRecognition = async () => {
     try {
+      return;
       const SR: any = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
       if (!SR) { setSttAvailable(false); setSttStatus('unsupported'); return; }
       // Start regardless of room state so preview always works
@@ -425,9 +509,47 @@ export default function App() {
       const rec: any = new SR();
       rec.continuous = true;
       rec.interimResults = true;
-      rec.lang = (navigator.language || 'en-US');
+      rec.lang = 'en-IN';
+      let hadResult = false;
+      // Ensure mic analyser is active for a visible input level
+      try {
+        if (!audioCtxRef.current || (audioCtxRef.current as any).state === 'closed') {
+          audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        }
+        if (audioCtxRef.current.state !== 'running') await audioCtxRef.current.resume();
+        const st = mediaStreamRef.current || (await navigator.mediaDevices.getUserMedia({ audio: true }));
+        mediaStreamRef.current = st;
+        if (!micMonitorRef.current) {
+          const src = audioCtxRef.current.createMediaStreamSource(st);
+          const gain = audioCtxRef.current.createGain();
+          gain.gain.value = monitorOn ? 0.15 : 0.0; // optional local monitor
+          src.connect(gain).connect(audioCtxRef.current.destination);
+          micMonitorRef.current = { source: src, gain } as any;
+        }
+        // Update monitor gain if toggled later
+        try { if (micMonitorRef.current) micMonitorRef.current.gain.gain.value = monitorOn ? 0.15 : 0.0; } catch {}
+        if (!micAnalyserRef.current && micMonitorRef.current) {
+          const analyser = audioCtxRef.current.createAnalyser();
+          analyser.fftSize = 256;
+          micAnalyserRef.current = analyser;
+          micMonitorRef.current.source.connect(analyser);
+        }
+        if (!micLevelRafRef.current && micAnalyserRef.current) {
+          const analyser = micAnalyserRef.current;
+          const data = new Uint8Array(analyser.frequencyBinCount);
+          const loop = () => {
+            try { analyser.getByteTimeDomainData(data); } catch {}
+            let sum = 0; for (let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum += v*v; }
+            const rms = Math.sqrt(sum/data.length);
+            setMicLevel(Math.min(1, rms*2));
+            micLevelRafRef.current = requestAnimationFrame(loop);
+          };
+          micLevelRafRef.current = requestAnimationFrame(loop);
+        }
+      } catch {}
       let buffer = '';
       rec.onresult = (e: any) => {
+        hadResult = true;
         let interim = '';
         let finalAdded = '';
         for (let i = e.resultIndex; i < e.results.length; i++) {
@@ -439,6 +561,8 @@ export default function App() {
         const full = (buffer + ' ' + interim).trim();
         transcriptRef.current = full;
         setTranscript(full);
+        setInterimText(interim);
+        setSttWarn(false);
         // Emit only newly added final chunk to server so others see it
         if (finalAdded.trim()) {
           try {
@@ -447,16 +571,215 @@ export default function App() {
           } catch {}
         }
       };
+      // Fallback: switch to en-US if we don't receive any results in 10s
+      setTimeout(() => {
+        try {
+          if (!hadResult && rec) { rec.stop(); rec.lang = 'en-US'; rec.start(); }
+        } catch {}
+      }, 10000);
       rec.onerror = (e: any) => {
         const name = (e?.error || '').toString();
         if (name.includes('not-allowed') || name.includes('service-not-allowed')) return;
         if (!sttManualStopRef.current) { try { rec.start(); } catch {} }
       };
-      rec.onend = () => { if (!meetingEnded && !sttManualStopRef.current) { try { rec.start(); } catch {} } };
+      rec.onend = () => {
+        if (!meetingEnded && !sttManualStopRef.current) {
+          try { rec.start(); } catch {}
+          // If SR keeps ending without results, show a warning and suggest retry
+          if (!hadResult) { setSttWarn(true); setSttWarnMsg('No speech detected. Check mic permissions or try retry.'); }
+        }
+      };
       try { rec.start(); } catch {}
       recognitionRef.current = rec;
       setSttStatus('running');
     } catch {}
+  };
+
+  // Deepgram live streaming (Option B)
+  const startDeepgramStreaming = async () => {
+    if (!socketRef.current) return;
+    try {
+      const st = mediaStreamRef.current || await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1 as any,
+          echoCancellation: false as any,
+          noiseSuppression: false as any,
+          autoGainControl: false as any,
+          sampleRate: 48000 as any,
+          sampleSize: 16 as any
+        } as any
+      });
+      mediaStreamRef.current = st;
+      // Ensure mic analyser is active for a visible input level
+      try {
+        if (!audioCtxRef.current || (audioCtxRef.current as any).state === 'closed') {
+          audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+        }
+        if (audioCtxRef.current.state !== 'running') await audioCtxRef.current.resume();
+        if (!micMonitorRef.current) {
+          const src = audioCtxRef.current.createMediaStreamSource(st);
+          const gain = audioCtxRef.current.createGain();
+          gain.gain.value = monitorOn ? 0.15 : 0.0;
+          src.connect(gain);
+          if (monitorOn) { try { gain.connect(audioCtxRef.current.destination); } catch {} }
+          micMonitorRef.current = { source: src, gain } as any;
+        }
+        try {
+          if (micMonitorRef.current) {
+            micMonitorRef.current.gain.gain.value = monitorOn ? 0.15 : 0.0;
+            if (monitorOn) {
+              try { (micMonitorRef.current.gain as any).connect?.(audioCtxRef.current!.destination); } catch {}
+            }
+          }
+        } catch {}
+        if (!micAnalyserRef.current && micMonitorRef.current) {
+          const analyser = audioCtxRef.current.createAnalyser();
+          analyser.fftSize = 256;
+          micAnalyserRef.current = analyser;
+          try { micMonitorRef.current.source.connect(analyser); } catch {}
+        }
+        if (!micLevelRafRef.current && micAnalyserRef.current) {
+          const analyser = micAnalyserRef.current;
+          const data = new Uint8Array(analyser.frequencyBinCount);
+          const loop = () => {
+            try { analyser.getByteTimeDomainData(data); } catch {}
+            let sum = 0; for (let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum += v*v; }
+            const rms = Math.sqrt(sum/data.length);
+            setMicLevel(Math.min(1, rms*2));
+            micLevelRafRef.current = requestAnimationFrame(loop);
+          };
+          micLevelRafRef.current = requestAnimationFrame(loop);
+        }
+      } catch {}
+      // MediaRecorder fallback sequence across containers/codecs
+      const candidatesRaw = [
+        'audio/webm;codecs=opus',
+        'audio/webm',
+        'audio/ogg;codecs=opus'
+      ];
+      const candidates: string[] = [];
+      for (const c of candidatesRaw) {
+        try { if ((MediaRecorder as any).isTypeSupported?.(c)) candidates.push(c); } catch { /* ignore */ }
+      }
+      if (!candidates.length) candidates.push('');
+
+      const sendPcmFallback = async () => {
+        try {
+          const ctx = audioCtxRef.current!;
+          const src = micMonitorRef.current?.source || ctx.createMediaStreamSource(st);
+          // ScriptProcessor fallback to capture PCM
+          const bufSize = 4096;
+          const node = ctx.createScriptProcessor(bufSize, 1, 1);
+          const inputSr = ctx.sampleRate || 48000;
+          const targetSr = 16000;
+          const ratio = inputSr / targetSr;
+          let remainder: Float32Array | null = null;
+          socketRef.current?.emit('stt:stream:start', { mimetype: 'pcm16', language: 'en-US' });
+          node.onaudioprocess = (e: AudioProcessingEvent) => {
+            try {
+              const ch0 = e.inputBuffer.getChannelData(0);
+              let data = ch0;
+              if (remainder && remainder.length) {
+                const tmp = new Float32Array(remainder.length + data.length);
+                tmp.set(remainder, 0); tmp.set(data, remainder.length);
+                data = tmp; remainder = null;
+              }
+              // Downsample to 16 kHz by simple decimation
+              const step = Math.max(1, Math.floor(ratio));
+              const outLen = Math.floor(data.length / step);
+              if (!outLen) { remainder = data; return; }
+              const out = new Int16Array(outLen);
+              for (let i = 0, j = 0; j < outLen; j++, i += step) {
+                const s = Math.max(-1, Math.min(1, data[i]));
+                out[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+              }
+              try { socketRef.current?.emit('stt:stream:chunk', out.buffer); } catch {}
+            } catch {}
+          };
+          try { src.connect(node); node.connect(ctx.destination); } catch {}
+          dgStreamingRef.current = true; setDgActive(true);
+          console.log('PCM fallback started at 16kHz');
+        } catch {
+          setSttWarn(true); setSttWarnMsg('Recording format unsupported. Try a different browser.');
+          dgStreamingRef.current = false; setDgActive(false);
+        }
+      };
+
+      const tryStart = (idx: number) => {
+        if (idx >= candidates.length) {
+          console.warn('No supported MediaRecorder mime types produced chunks. Falling back to PCM.');
+          sendPcmFallback();
+          return;
+        }
+        const mime = candidates[idx] || undefined as any;
+        console.log('MediaRecorder mime =', mime || '(browser default)');
+        try { socketRef.current?.emit('stt:stream:start', { mimetype: mime || 'default', language: 'en-US' }); } catch {}
+        let rec: MediaRecorder;
+        try { rec = new MediaRecorder(st, mime ? { mimeType: mime } : undefined as any); }
+        catch (e) {
+          console.warn('MediaRecorder create failed for', mime, e);
+          return tryStart(idx + 1);
+        }
+        dgMediaRecRef.current = rec;
+        dgStreamingRef.current = true;
+        setDgActive(true);
+        let firstChunkTs = 0;
+        let emptyCount = 0;
+        rec.addEventListener('start', () => { console.log('MediaRecorder started'); socketRef.current?.emit('stt:dg:status', { ok: true, event: 'client_mediarec_start', mime }); });
+        rec.addEventListener('stop',  () => { console.log('MediaRecorder stopped'); });
+        rec.addEventListener('error', (e: any) => { console.warn('MediaRecorder error', e?.name || e?.message || e); });
+        rec.addEventListener('pause', () => { console.log('MediaRecorder pause'); });
+        rec.addEventListener('resume', () => { console.log('MediaRecorder resume'); });
+        rec.addEventListener('dataavailable', (ev) => {
+          const b = ev.data;
+          if (b && b.size) {
+            console.log('MediaRecorder chunk size', b.size);
+            b.arrayBuffer().then((ab) => {
+              try { socketRef.current?.emit('stt:stream:chunk', ab); } catch {}
+            }).catch(()=>{});
+            if (!firstChunkTs) firstChunkTs = Date.now();
+            emptyCount = 0;
+          } else {
+            console.warn('MediaRecorder empty chunk');
+            emptyCount++;
+            if (emptyCount >= 5) {
+              console.warn('Too many empty chunks for', mime, '— trying next');
+              try { rec.stop(); } catch {}
+              setTimeout(() => tryStart(idx + 1), 100);
+            }
+          }
+        });
+        rec.addEventListener('stop', () => {
+          try { socketRef.current?.emit('stt:stream:stop'); } catch {}
+          dgStreamingRef.current = false;
+          setDgActive(false);
+        });
+        try { rec.start(500); } catch { return tryStart(idx + 1); }
+        // Force periodic flush to generate dataavailable
+        const flushId = window.setInterval(() => { try { if (rec.state === 'recording') rec.requestData(); } catch {} }, 500);
+        const clearFlush = () => { try { window.clearInterval(flushId); } catch {} };
+        rec.addEventListener('stop', clearFlush, { once: true } as any);
+        // Watchdog: if no chunks within 2s, stop and try next candidate
+        setTimeout(() => {
+          try {
+            if (!firstChunkTs && dgMediaRecRef.current === rec && rec.state === 'recording') {
+              console.warn('No chunks within 2s for', mime, '— trying next');
+              try { rec.stop(); } catch {}
+              setTimeout(() => tryStart(idx + 1), 100);
+            }
+          } catch {}
+        }, 2000);
+      };
+      tryStart(0);
+    } catch {
+      // If mic denied, show warning
+      setSttWarn(true); setSttWarnMsg('Microphone not accessible. Allow mic and retry.');
+    }
+  };
+  const stopDeepgramStreaming = () => {
+    try { dgMediaRecRef.current?.stop(); } catch {}
+    dgMediaRecRef.current = null; dgStreamingRef.current = false; setDgActive(false);
+    try { socketRef.current?.emit('stt:stream:stop'); } catch {}
   };
   // Whiteboard state
   const [wbOpen, setWbOpen] = useState<boolean>(false);
@@ -471,9 +794,16 @@ export default function App() {
   const wbToolRef = useRef<'pencil'|'brush'|'marker'|'eraser'|'airbrush'|'fill'>('pencil');
   const wbLastEmitRef = useRef<number>(0);
   const modelUrls = [
+    // Human male
     'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/CesiumMan/glTF-Binary/CesiumMan.glb',
+    // Human soldier
+    'https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/models/gltf/Soldier.glb',
+    // Cartoonish robot
     'https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/models/gltf/RobotExpressive/RobotExpressive.glb',
-    'https://raw.githubusercontent.com/mrdoob/three.js/dev/examples/models/gltf/Soldier.glb'
+    // Fox (animal as a fun avatar)
+    'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/Fox/glTF-Binary/Fox.glb',
+    // Woman character (RiggedSimple as a lightweight human mesh)
+    'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/RiggedSimple/glTF-Binary/RiggedSimple.glb'
   ];
 
   const modelUrlForAvatar = (val: string) => {
@@ -513,6 +843,36 @@ export default function App() {
       body.castShadow = true;
       g.add(body);
       return { group: g, clips: [] };
+    }
+  };
+
+  // Generate a small thumbnail image for a GLB/GLTF model via offscreen render
+  const generateGlbThumbnail = async (url: string): Promise<string> => {
+    try {
+      const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js');
+      const loader = new GLTFLoader();
+      const gltf = await new Promise<any>((resolve, reject) => loader.load(url, resolve, undefined, reject));
+      const scene = new THREE.Scene();
+      const obj = gltf.scene || new THREE.Group();
+      scene.add(obj);
+      const light = new THREE.DirectionalLight(0xffffff, 1); light.position.set(3,4,5); scene.add(light);
+      scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+      const bbox = new THREE.Box3().setFromObject(obj);
+      const size = bbox.getSize(new THREE.Vector3());
+      const center = bbox.getCenter(new THREE.Vector3());
+      const w = 320, h = 240;
+      const cam = new THREE.PerspectiveCamera(50, w/h, 0.01, 100);
+      const dist = Math.max(size.length(), 1.0);
+      cam.position.set(center.x + dist, center.y + dist*0.6, center.z + dist);
+      cam.lookAt(center);
+      const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true, alpha: true });
+      renderer.setSize(w, h); renderer.setPixelRatio(1);
+      renderer.render(scene, cam);
+      const dataUrl = (renderer.domElement as HTMLCanvasElement).toDataURL('image/png');
+      try { renderer.dispose(); } catch {}
+      return dataUrl;
+    } catch {
+      return '';
     }
   };
 
@@ -862,6 +1222,7 @@ export default function App() {
     // Ensure new joiners sync the current whiteboard state immediately
     socket.emit('whiteboard:requestState');
     socket.emit('media:requestState');
+    socket.emit('stt:requestState');
     socket.on('media:state', (payload:any) => {
       try {
         const items = (payload?.items || []).map((m:any) => ({ name: m.name, url: m.dataUrl, type: m.type }));
@@ -898,7 +1259,20 @@ export default function App() {
         const next = (transcriptRef.current ? (transcriptRef.current + ' ') : '') + (entry?.text || '');
         transcriptRef.current = next;
         setTranscript(next);
+        setInterimText('');
       } catch {}
+    });
+    socket.on('stt:interim', (p: any) => {
+      try { setInterimText(p?.text || ''); console.log('stt:interim', p?.text); } catch {}
+    });
+    socket.on('stt:dg:status', (s: any) => {
+      if (!s) return;
+      console.log('stt:dg:status', s);
+      if (s.ok === false) {
+        const msg = (s.message || s.reason || s.error || '').toString() || 'Speech service error';
+        setSttWarn(true);
+        setSttWarnMsg(msg);
+      }
     });
 
     socket.on("presence:roster", (members: Array<{ id: string; name: string; avatar?: { kind: 'color' | 'image' | 'model'; value: string } }>) => {
@@ -1077,6 +1451,8 @@ export default function App() {
       } catch {}
     });
 
+    // Start Deepgram streaming for higher accuracy transcription
+    startDeepgramStreaming();
     const interval = setInterval(() => {
       if (meetingEndedRef.current) return;
       if (!localAvatarRef.current) return;
@@ -1142,8 +1518,9 @@ export default function App() {
     const onFirstClick = async () => {
       await resumeAllRemoteAudio();
       try {
-        if (joined && !meetingEnded && sttAvailable) {
-          if (recognitionRef.current) { recognitionRef.current.start?.(); }
+        // Only rely on Deepgram streaming, not browser SR
+        if (joined && !meetingEnded && !dgStreamingRef.current) {
+          await startDeepgramStreaming();
         }
       } catch {}
     };
@@ -1151,8 +1528,18 @@ export default function App() {
     return () => { window.removeEventListener('click', onFirstClick as any); };
   }, [joined, meetingEnded, sttAvailable]);
 
-  // STT watchdog: ensure SR keeps running during the meeting
+  // Ensure SR starts as soon as we join (disabled: using Deepgram only)
   useEffect(() => {
+    if (!USE_BROWSER_SR) return;
+    if (!joined || meetingEnded) return;
+    if (!sttAvailable) return;
+    if (recognitionRef.current) return;
+    (async () => { try { await startRecognition(); } catch {} })();
+  }, [joined, meetingEnded, sttAvailable]);
+
+  // STT watchdog: disabled when using Deepgram only
+  useEffect(() => {
+    if (!USE_BROWSER_SR) return;
     if (!joined || meetingEnded || !sttAvailable) return;
     const id = window.setInterval(() => {
       try {
@@ -1239,7 +1626,7 @@ export default function App() {
       if (/\b(will|todo|to do|next|follow up|assign|ownership|deadline|deliver|prepare|send|share)\b/i.test(l)) acts.push(l);
     }
     const decs: string[] = [];
-    for (const line of (txt+"\n"+chatText).split(/\n|\.|\?|!/)) {
+    for (const line of (txt+"\n"+chatText).split(/\n|\.|\?|!/)) {   
       const l=line.trim(); if(!l) continue;
       if (/\b(decide|decided|agree|agreed|approved|choose|chose|select|selected)\b/i.test(l)) decs.push(l);
     }
@@ -1252,8 +1639,53 @@ export default function App() {
   };
 
   const lastMeetingIdRef = useRef<string | null>(null);
+  const [micDevices, setMicDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedMicId, setSelectedMicId] = useState<string>('');
+  
+  
+
+  const refreshMicDevices = async () => {
+    try {
+      await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {}
+    try {
+      const devs = await navigator.mediaDevices.enumerateDevices();
+      const mics = devs.filter((d) => d.kind === 'audioinput');
+      setMicDevices(mics as any);
+      if (!selectedMicId && mics[0]?.deviceId) setSelectedMicId(mics[0].deviceId);
+    } catch {}
+  };
+
+  const switchMicTo = async (deviceId: string) => {
+    try {
+      const st = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: deviceId } as any } });
+      // Replace local audio track everywhere
+      const atrack = st.getAudioTracks()[0] || null;
+      mediaStreamRef.current = mediaStreamRef.current || new MediaStream();
+      // Remove old audio tracks from local stream
+      try { for (const t of mediaStreamRef.current.getAudioTracks()) { mediaStreamRef.current.removeTrack(t); t.stop(); } } catch {}
+      if (atrack) mediaStreamRef.current.addTrack(atrack);
+      await replaceAudioTrackForAll(atrack as any);
+      // Rebuild local monitor
+      try {
+        if (!audioCtxRef.current || (audioCtxRef.current as any).state === 'closed') { audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)(); }
+        if (audioCtxRef.current.state !== 'running') await audioCtxRef.current.resume();
+        const src = audioCtxRef.current.createMediaStreamSource(mediaStreamRef.current as MediaStream);
+        const gain = audioCtxRef.current.createGain();
+        gain.gain.value = 0.0;
+        src.connect(gain).connect(audioCtxRef.current.destination);
+        micMonitorRef.current = { source: src, gain } as any;
+      } catch {}
+      setMicEnabled(true);
+    } catch (e) {
+      setErrorMsg('Failed to switch microphone');
+    }
+  };
 
   useEffect(() => {
+    if (!USE_BROWSER_SR) return;
+    // If a recognizer already exists, don't create another
+    if (recognitionRef.current) return;
     let recognition: any = null;
     let stopRequested = false;
     let lastResultTs = Date.now();
@@ -1264,7 +1696,7 @@ export default function App() {
     recognition = new SpeechRecognition();
     recognition.continuous = true;
     recognition.interimResults = true;
-    recognition.lang = 'en-US';
+    recognition.lang = 'en-IN';
     try { recognition.maxAlternatives = 1; } catch {}
     recognition.onstart = () => { try { setSttStatus('running'); console.log('SpeechRecognition started'); } catch {} };
     let recent = '';
@@ -1410,7 +1842,7 @@ export default function App() {
     try { pc.addTransceiver('video', { direction: 'sendrecv' }); } catch {}
     pc.onnegotiationneeded = async () => {
       try {
-        if (pc.signalingState === 'stable' || pc.signalingState === 'have-local-offer' || pc.signalingState === 'have-remote-offer') {
+        if (pc.signalingState === 'stable') {
           const offer = await pc.createOffer();
           await pc.setLocalDescription(offer);
           socketRef.current?.emit("webrtc:signal", { to: peerId, from: userIdRef.current, data: pc.localDescription });
@@ -1439,9 +1871,11 @@ export default function App() {
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((track: MediaStreamTrack) => pc.addTrack(track, mediaStreamRef.current as MediaStream));
     }
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    socketRef.current?.emit("webrtc:signal", { to: peerId, from: userIdRef.current, data: pc.localDescription });
+    if (pc.signalingState === 'stable') {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socketRef.current?.emit("webrtc:signal", { to: peerId, from: userIdRef.current, data: pc.localDescription });
+    }
   };
 
   const teardownPeer = (peerId: string) => {
@@ -1488,13 +1922,15 @@ export default function App() {
           const src = audioCtxRef.current.createMediaStreamSource(stream);
           const gain = audioCtxRef.current.createGain();
           gain.gain.value = 0.0; // start muted until toggled on
-          src.connect(gain).connect(audioCtxRef.current.destination);
+          src.connect(gain);
           micMonitorRef.current = { source: src, gain };
           // Create analyser for mic level meter
           const analyser = audioCtxRef.current.createAnalyser();
           analyser.fftSize = 256;
           micAnalyserRef.current = analyser;
           try { src.connect(analyser); } catch {}
+          // Only connect to speakers if monitor is enabled later
+          if (monitorOn) { try { gain.connect(audioCtxRef.current.destination); } catch {} }
           // start update loop (will show ~0 until mic unmuted)
           const data = new Uint8Array(analyser.frequencyBinCount);
           const loop = () => {
@@ -1805,6 +2241,9 @@ export default function App() {
                         sessionStorage.setItem('lastRoomId', roomCodeInput);
                         sessionStorage.setItem('joined','1');
                       }}>Join</button>
+                      <button className="rounded-md px-4 py-2 bg-white/10 hover:bg-white/20 text-white border border-white/20" onClick={async()=>{
+                        try { const t = await navigator.clipboard.readText(); if (t) setRoomCodeInput(t.trim().toUpperCase()); } catch {}
+                      }}>Paste</button>
                     </div>
                   </div>
                 )}
@@ -1827,9 +2266,10 @@ export default function App() {
               <span className="ml-2 flex items-center gap-2">
                 <span className="text-xs px-2 py-1 rounded bg-[#3D2C8D] text-white">Room: {roomId}</span>
                 <button
-                  className="text-xs px-2 py-1 rounded bg-white/10 hover:bg-white/20 text-white border border-white/20"
-                  onClick={async()=>{ try { await navigator.clipboard.writeText(roomId); } catch {} }}
-                >Copy Code</button>
+                  className={`text-xs px-2 py-1 rounded border border-white/20 ${copied ? 'bg-emerald-400 text-black animate-pulse' : 'bg-white/10 hover:bg-white/20 text-white'}`}
+                  onClick={async()=>{ try { await navigator.clipboard.writeText(roomId); setCopied(true); setTimeout(()=>setCopied(false), 1200); } catch {} }}
+                  title={copied ? 'Copied!' : 'Copy to clipboard'}
+                >{copied ? 'Copied ✓' : 'Copy Code'}</button>
               </span>
             )}
           </div>
@@ -1844,6 +2284,7 @@ export default function App() {
                 try { localStorage.setItem('authUser', JSON.stringify(user)); } catch {}
               }}>Set Name</button>
               <button className="btn-secondary hover:brightness-110 bg-[#3D2C8D] hover:bg-[#7A00FF] text-white" onClick={() => { const code = roomCodeInput.trim(); if (code) { setRoomId(code); sessionStorage.setItem('lastRoomId', code); } }}>Use Code</button>
+              <button className={`btn-secondary ${pasted ? 'bg-emerald-500 text-black animate-pulse' : 'bg-white/10'} border border-white/20`} onClick={async()=>{ try { const t = await navigator.clipboard.readText(); if (t) { setRoomCodeInput(t.trim()); setPasted(true); setTimeout(()=>setPasted(false), 1200); } } catch {} }}>Paste Code</button>
               <button className="btn-secondary hover:brightness-110 bg-[#3D2C8D] hover:bg-[#7A00FF] text-white" onClick={() => { const code = "room-" + Math.random().toString(36).slice(2, 8); setRoomId(code); setRoomCodeInput(code); sessionStorage.setItem('lastRoomId', code); }}>Create Room</button>
               <button className="btn-secondary hover:brightness-110 bg-[#3D2C8D] hover:bg-[#7A00FF] text-white" onClick={() => { loadMeetings(); setDashboardOpen(true); }}>Dashboard</button>
               <button className="btn-primary shadow-sm hover:shadow-md bg-[#3D2C8D] hover:bg-[#7A00FF] text-white" onClick={async () => {
@@ -1860,8 +2301,19 @@ export default function App() {
                     mediaStreamRef.current = stream;
                     if (videoRef.current && stream) { videoRef.current.srcObject = stream; await videoRef.current.play().catch(() => {}); }
                     nameRef.current = displayName; setMeetingEnded(false); setJoined(true); sessionStorage.setItem('joined', '1');
-                    const selected = (user?.avatar?.value) || avatarImage; const url = modelUrlForAvatar(selected);
-                    const { group: obj, clips } = await loadModel(url); obj.traverse((o) => { (o as any).castShadow = true; }); localAvatarRef.current = obj; const scene = sceneRef.current; if (scene) scene.add(obj);
+                    // Choose a distinct avatar/model per user deterministically
+                    const idx = hashId(userIdRef.current) % modelUrls.length;
+                    const url = modelUrls[idx];
+                    const { group: obj, clips } = await loadModel(url);
+                    obj.traverse((o) => { (o as any).castShadow = true; });
+                    localAvatarRef.current = obj;
+                    const scene = sceneRef.current; if (scene) scene.add(obj);
+                    // Hide placeholder cube if present
+                    try { const ph = scene?.getObjectByName('placeholderBox'); if (ph) (ph as any).visible = false; } catch {}
+                    // Spawn near center in a circle so multiple users appear around the center
+                    const ang = (hashId(userIdRef.current) % 360) * Math.PI / 180;
+                    const rad = 2.0;
+                    obj.position.set(Math.cos(ang) * rad, 0, Math.sin(ang) * rad);
                     baseRotXRef.current = obj.rotation.x || 0; if (clips && clips.length) { localMixerRef.current = new THREE.AnimationMixer(obj); const idle = clips[0]; const walk = clips[1]; const idleAct = localMixerRef.current.clipAction(idle); idleAct.play(); const walkAct = walk ? localMixerRef.current.clipAction(walk) : undefined; localActionsRef.current = { idle: idleAct, walk: walkAct, current: 'idle' }; }
                     setTimeout(() => { resumeAllRemoteAudio(); }, 300);
                   }
@@ -2069,12 +2521,26 @@ export default function App() {
                   <button className="btn-secondary" onClick={()=>setWbOpen((v)=>!v)}>{wbOpen ? 'Hide Whiteboard' : 'Show Whiteboard'}</button>
                   <button className="btn-secondary" onClick={()=>{ setDocOpen(v=>!v); if (!docOpen) socketRef.current?.emit('doc:requestState'); }}>{docOpen ? 'Hide Doc' : 'Open Doc'}</button>
                   <button className="btn-primary" onClick={()=> { setSummaryBusy(true); setSummaryText(''); socketRef.current?.emit('stt:summary'); }} disabled={summaryBusy}>{summaryBusy ? 'Summarizing…' : 'Transcript Summary'}</button>
+                  <button className="btn-secondary" onClick={()=> setMotionTracking(v=>!v)}>{motionTracking ? 'Disable Motion Tracking' : 'Enable Motion Tracking'}</button>
                 </div>
               </div>
               {docOpen && (
                 <div className="px-3 pb-3">
                   <div className="rounded-md border border-white/10 bg-black/30">
-                    <div className="p-2 text-xs text-white/70">Shared Document</div>
+                    <div className="p-2 text-xs text-white/70 flex items-center justify-between">
+                      <span>Shared Document</span>
+                      <button className="px-2 py-1 rounded bg-white/10 hover:bg-white/20 border border-white/10 text-white" onClick={() => {
+                        try {
+                          const blob = new Blob([docText || ''], { type: 'text/plain;charset=utf-8' });
+                          const a = document.createElement('a');
+                          a.href = URL.createObjectURL(blob);
+                          a.download = `room-${roomId || 'session'}-document.txt`;
+                          document.body.appendChild(a);
+                          a.click();
+                          setTimeout(()=>{ URL.revokeObjectURL(a.href); try{ a.remove(); } catch{} }, 800);
+                        } catch {}
+                      }}>Download</button>
+                    </div>
                     <textarea
                       className="w-full h-40 p-3 bg-black/40 text-white outline-none resize-y"
                       value={docText}
@@ -2200,12 +2666,66 @@ export default function App() {
             <div className="mt-4">
               <div className="card shadow-sm bg-[#1E1E1E] border border-[#2A2A2A]">
                 <div className="card-body">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Transcript Preview</h3>
-                    <span className="text-xs text-white/70">Live speech-to-text</span>
+                  <h3 className="text-[#F1F1F1] font-semibold tracking-wide">Transcript Preview</h3>
+                  <div className="mt-2">
+                    <div className="mb-2 flex items-center gap-2 text-xs text-white/80">
+                      <label className="inline-flex items-center gap-1 cursor-pointer select-none">
+                        <input type="checkbox" checked={monitorOn} onChange={(e)=>{ setMonitorOn(e.target.checked); try { if (micMonitorRef.current) micMonitorRef.current.gain.gain.value = e.target.checked ? 0.15 : 0.0; } catch {} }} />
+                        Monitor mic (hear yourself)
+                      </label>
+                    </div>
+                    {!dgActive && (
+                      <div className="mb-2">
+                        <button
+                          className="btn border border-white/20 bg-white/10 hover:bg-white/20 text-white text-xs px-3 py-1 rounded"
+                          onClick={async ()=>{ try { await audioCtxRef.current?.resume?.(); } catch {}; await startDeepgramStreaming(); try { await startRecognition(); } catch {} }}
+                        >
+                          Enable Microphone
+                        </button>
+                      </div>
+                    )}
+                    <div className="text-[11px] text-white/60 mb-1">Mic level</div>
+                    <div className="h-2 w-full bg-white/10 rounded overflow-hidden">
+                      <div
+                        className="h-2 bg-emerald-400 transition-[width] duration-150"
+                        style={{ width: `${Math.min(100, Math.max(0, Math.round((micLevel||0) * 100)))}%` }}
+                        aria-label="Microphone input level"
+                      />
+                    </div>
                   </div>
                   <div className="mt-2 max-h-48 overflow-y-auto border border-[#2A2A2A] rounded p-3 bg-[#111111] text-sm whitespace-pre-wrap text-[#F1F1F1]" aria-live="polite">
-                    {transcript && transcript.trim().length > 0 ? transcript : <span className="text-white/40">Listening…</span>}
+                    {sttWarn && (
+                      <div className="mb-2 text-amber-400">
+                        {sttWarnMsg || 'No speech detected. Check mic permissions and retry.'}
+                        <button
+                          className="ml-2 inline-flex items-center px-2 py-1 rounded bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200"
+                          onClick={() => { setSttWarn(false); setSttWarnMsg(''); try { startRecognition(); } catch {}; try { startDeepgramStreaming(); } catch {}; }}
+                        >
+                          Retry
+                        </button>
+                      </div>
+                    )}
+                    {(() => {
+                      const base = transcript && transcript.trim().length > 0 ? transcript : 'Listening…';
+                      return interimText ? `${base} ${interimText}` : base;
+                    })()}
+                  </div>
+                  <div className="mt-3">
+                    <div className="text-[11px] text-white/60 mb-1">Share 3D model thumbnail</div>
+                    <input
+                      type="file"
+                      accept=".glb,.gltf,model/gltf-binary,model/gltf+json"
+                      onChange={async (e) => {
+                        const f = e.currentTarget.files?.[0]; if (!f) return;
+                        const blobUrl = URL.createObjectURL(f);
+                        const thumb = await generateGlbThumbnail(blobUrl);
+                        if (thumb) {
+                          socketRef.current?.emit('media:add', { items: [{ name: f.name, type: 'image/png', dataUrl: thumb }] });
+                          setMediaItems(prev => [...prev, { name: f.name, url: thumb, type: 'image/png' }]);
+                        }
+                      }}
+                      className="block w-full text-xs text-[#A0A0A0]"
+                    />
                   </div>
                 </div>
               </div>
@@ -2396,7 +2916,25 @@ export default function App() {
                     </button>
                   </div>
                 </div>
-                {/* Thumbnails removed as requested; swipe-only selection */}
+                {/* Clickable avatar thumbnails */}
+                <div className="mt-4 flex items-center justify-center flex-wrap gap-3">
+                  {animatedAvatars.map((src, i) => (
+                    <button
+                      key={src}
+                      onClick={() => setAvatarIdx(i)}
+                      className={`h-16 w-16 rounded-xl overflow-hidden border transition-transform hover:scale-105 ${i===avatarIdx ? 'ring-2 ring-white border-white/60' : 'border-white/20'}`}
+                      title={`Select avatar ${i+1}`}
+                    >
+                      <img
+                        src={toImageSrc(src)}
+                        alt={`avatar ${i+1}`}
+                        referrerPolicy="no-referrer"
+                        className="h-full w-full object-cover"
+                        onError={(e) => { e.currentTarget.src = avatarFallbacks[i % avatarFallbacks.length]; }}
+                      />
+                    </button>
+                  ))}
+                </div>
                 <div className="mt-6 flex items-center justify-center">
                   <button
                     className="rounded-full px-7 py-3 text-white bg-gradient-to-r from-[#C63D5A] to-[#7A1136] hover:from-[#d44a68] hover:to-[#8a1a44] shadow-xl transition-transform duration-200 hover:scale-[1.03] active:scale-[0.99]"

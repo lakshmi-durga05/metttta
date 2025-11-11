@@ -1,7 +1,9 @@
+require('dotenv').config();
 const http = require('http');
 const { Server } = require('socket.io');
 const fs = require('fs');
 const path = require('path');
+const { createClient } = require('@deepgram/sdk');
 const PORT = process.env.PORT || 3001;
 const server = http.createServer();
 const io = new Server(server, {
@@ -28,10 +30,64 @@ const roomChats = new Map();   // roomId -> { messages: Array<{ userId, name, te
 
 const transcriptsDir = path.join(__dirname, 'transcripts');
 try { if (!fs.existsSync(transcriptsDir)) fs.mkdirSync(transcriptsDir, { recursive: true }); } catch {}
- 
+// Batch-only switch (disable Deepgram live websockets). Default true for reliability on restrictive networks.
+const STT_BATCH_ONLY = (process.env.STT_BATCH_ONLY === '1' || process.env.STT_BATCH_ONLY === 'true' || true);
+
+// Batch transcription fallback state (per room)
+const roomAudio = new Map(); // roomId -> { mimetype: string, chunks: Buffer[], timer: NodeJS.Timeout|null }
+
+function ensureRoomAudio(roomId, mimetype) {
+  const r = roomAudio.get(roomId) || { mimetype: mimetype || 'pcm16', chunks: [], timer: null };
+  r.mimetype = mimetype || r.mimetype || 'pcm16';
+  if (!r.chunks) r.chunks = [];
+  roomAudio.set(roomId, r);
+  return r;
+}
+
+function pcm16ToWav(int16Buffer, sampleRate = 16000, channels = 1) {
+  const bytesPerSample = 2;
+  const dataLength = int16Buffer.byteLength;
+  const buffer = Buffer.alloc(44 + dataLength);
+  buffer.write('RIFF', 0);
+  buffer.writeUInt32LE(36 + dataLength, 4);
+  buffer.write('WAVE', 8);
+  buffer.write('fmt ', 12);
+  buffer.writeUInt32LE(16, 16); // PCM header size
+  buffer.writeUInt16LE(1, 20); // audio format = PCM
+  buffer.writeUInt16LE(channels, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(sampleRate * channels * bytesPerSample, 28);
+  buffer.writeUInt16LE(channels * bytesPerSample, 32);
+  buffer.writeUInt16LE(8 * bytesPerSample, 34);
+  buffer.write('data', 36);
+  buffer.writeUInt32LE(dataLength, 40);
+  Buffer.from(int16Buffer).copy(buffer, 44);
+  return buffer;
+}
+
+async function transcribeBatchWithOpenAI(buf, mimetype) {
+  const apiKey = process.env.OPENAI_API_KEY || '';
+  if (!apiKey) throw new Error('OPENAI_API_KEY missing');
+  const filename = mimetype === 'pcm16' ? 'audio.wav' : (mimetype.includes('ogg') ? 'audio.ogg' : 'audio.webm');
+  const form = new FormData();
+  form.append('file', new Blob([buf]), filename);
+  form.append('model', 'whisper-1');
+  const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${apiKey}` },
+    body: form
+  });
+  if (!res.ok) throw new Error('OpenAI transcribe failed: ' + res.status + ' ' + (await res.text()).slice(0, 500));
+  const js = await res.json();
+  return (js?.text || '').toString();
+}
+
 io.on('connection', (socket) => {
   let joinedRoom = null;
   let user = null;
+  const deepgramKey = process.env.DEEPGRAM_API_KEY || '';
+  const deepgram = deepgramKey ? createClient(deepgramKey) : null;
+  let dgConn = null; // Deepgram live connection per socket
 
   socket.on('room:join', ({ roomId, userId, name, avatar }) => {
     joinedRoom = roomId;
@@ -51,6 +107,175 @@ io.on('connection', (socket) => {
     if (!whiteboards.has(roomId)) whiteboards.set(roomId, { actions: [] });
     if (!roomMedia.has(roomId)) roomMedia.set(roomId, { items: [] });
     if (!roomChats.has(roomId)) roomChats.set(roomId, { messages: [] });
+  });
+
+  // Live STT streaming via Deepgram
+  // Client should emit:
+  //  - 'stt:stream:start' with { mimetype?: string, language?: string }
+  //  - 'stt:stream:chunk' with raw binary audio chunks (Buffer) from MediaRecorder
+  //  - 'stt:stream:stop'
+  socket.on('stt:stream:start', async (cfg = {}) => {
+    // Allow STT even if Deepgram client isn't available (batch-only mode)
+    if (!joinedRoom) { return; }
+    try {
+      if (dgConn) { try { await dgConn.finish(); } catch {} dgConn = null; }
+      socket.emit('stt:dg:status', { ok: true, event: 'client_start', cfg });
+      const mimetype = typeof cfg.mimetype === 'string' && cfg.mimetype ? cfg.mimetype : 'audio/webm;codecs=opus';
+      const language = typeof cfg.language === 'string' && cfg.language ? cfg.language : 'en-US';
+      // Map client mimetype to Deepgram encoding/options
+      let dgOpts = {
+        model: 'nova-2-general',
+        language,
+        detect_language: true,
+        interim_results: true,
+        smart_format: true,
+        punctuate: true,
+        endpointing: 100,
+      };
+      const mt = (mimetype || '').toLowerCase();
+      if (STT_BATCH_ONLY) {
+        // Initialize batch-only buffer as pcm16; client fallback sends Int16 chunks via socket
+        const ra = ensureRoomAudio(joinedRoom, 'pcm16');
+        if (!ra.timer) {
+          ra.timer = setInterval(async () => {
+            try {
+              const current = roomAudio.get(joinedRoom);
+              if (!current || current.chunks.length === 0) return;
+              if ((current.mimetype || '').toLowerCase() !== 'pcm16') return;
+              const merged = Buffer.concat(current.chunks);
+              current.chunks = [];
+              const wav = pcm16ToWav(merged, 16000, 1);
+              try {
+                try { socket.emit('stt:dg:status', { ok: true, event: 'batch_start', bytes: merged.length }); } catch {}
+                const text = await transcribeBatchWithOpenAI(wav, 'pcm16');
+                if (text && text.trim()) {
+                  const entry = { userId: user?.id, name: user?.name || 'Guest', text: text.trim(), ts: Date.now() };
+                  const bag = roomTranscripts.get(joinedRoom) || { segments: [] };
+                  bag.segments.push(entry);
+                  roomTranscripts.set(joinedRoom, bag);
+                  io.to(joinedRoom).emit('stt:segment', entry);
+                  try { socket.emit('stt:dg:status', { ok: true, event: 'batch_ok', chars: text.trim().length }); } catch {}
+                }
+              } catch (e) { }
+            } catch {}
+          }, 7000);
+        }
+        // Do not open Deepgram websocket in batch-only mode
+        dgConn = null;
+      } else if (deepgram) {
+        if (mt === 'pcm16') {
+          dgOpts = { ...dgOpts, encoding: 'linear16', sample_rate: 16000, channels: 1 };
+        } else if (mt.includes('webm')) {
+          dgOpts = { ...dgOpts, encoding: 'webm' };
+        } else if (mt.includes('ogg')) {
+          dgOpts = { ...dgOpts, encoding: 'ogg' };
+        } else if (mt.includes('opus')) {
+          dgOpts = { ...dgOpts, encoding: 'ogg' };
+        } else {
+          dgOpts = { ...dgOpts, encoding: 'webm' };
+        }
+        dgConn = deepgram.listen.live(dgOpts);
+        dgConn.on('open', () => { socket.emit('stt:dg:status', { ok: true, event: 'open' }); });
+        dgConn.on('error', (err) => { const msg = (err && (err.message || err.toString?.())) || 'unknown'; try { socket.emit('stt:dg:status', { ok: false, event: 'error', message: msg }); } catch {} });
+        dgConn.on('close', (evt) => { let code, reason; try { code = evt?.code; reason = evt?.reason || evt?.message; } catch {} try { socket.emit('stt:dg:status', { ok: true, event: 'close', code, reason }); } catch {} });
+        const handleTranscript = (dgMsg) => {
+          try {
+            const ch = dgMsg && dgMsg.channel; const alt = ch && ch.alternatives && ch.alternatives[0]; const text = (alt && alt.transcript) || '';
+            if (!text) return; const isFinal = Boolean(dgMsg.is_final);
+            if (isFinal) { const entry = { userId: user?.id, name: user?.name || 'Guest', text: text.trim(), ts: Date.now() }; const bag = roomTranscripts.get(joinedRoom) || { segments: [] }; bag.segments.push(entry); roomTranscripts.set(joinedRoom, bag); io.to(joinedRoom).emit('stt:segment', entry); }
+            else { socket.emit('stt:interim', { text }); }
+          } catch {}
+        };
+        dgConn.on('transcript', handleTranscript);
+        dgConn.on('transcriptReceived', handleTranscript);
+      }
+
+      // Initialize batch fallback buffer for this room (only used for pcm16 reliably)
+      try {
+        const ra = ensureRoomAudio(joinedRoom, mimetype);
+        if (!ra.timer) {
+          ra.timer = setInterval(async () => {
+            try {
+              const current = roomAudio.get(joinedRoom);
+              if (!current || current.chunks.length === 0) return;
+              // Only batch for pcm16 to ensure valid WAV
+              if ((current.mimetype || '').toLowerCase() !== 'pcm16') return;
+              const merged = Buffer.concat(current.chunks);
+              current.chunks = [];
+              const wav = pcm16ToWav(merged, 16000, 1);
+              try {
+                try { socket.emit('stt:dg:status', { ok: true, event: 'batch_start', bytes: merged.length }); } catch {}
+                const text = await transcribeBatchWithOpenAI(wav, 'pcm16');
+                if (text && text.trim()) {
+                  const entry = { userId: user?.id, name: user?.name || 'Guest', text: text.trim(), ts: Date.now() };
+                  const bag = roomTranscripts.get(joinedRoom) || { segments: [] };
+                  bag.segments.push(entry);
+                  roomTranscripts.set(joinedRoom, bag);
+                  io.to(joinedRoom).emit('stt:segment', entry);
+                  try { socket.emit('stt:dg:status', { ok: true, event: 'batch_ok', chars: text.trim().length }); } catch {}
+                }
+              } catch (e) { }
+            } catch {}
+          }, 7000);
+        }
+      } catch {}
+
+      // Live-DG event hooks are installed only when not in batch-only mode
+      const handleTranscript = (dgMsg) => {
+        try {
+          const ch = dgMsg && dgMsg.channel;
+          const alt = ch && ch.alternatives && ch.alternatives[0];
+          const text = (alt && alt.transcript) || '';
+          if (!text) return;
+          const isFinal = Boolean(dgMsg.is_final);
+          if (isFinal) {
+            // Save and broadcast to room as a final segment
+            const entry = { userId: user?.id, name: user?.name || 'Guest', text: text.trim(), ts: Date.now() };
+            const bag = roomTranscripts.get(joinedRoom) || { segments: [] };
+            bag.segments.push(entry);
+            roomTranscripts.set(joinedRoom, bag);
+            io.to(joinedRoom).emit('stt:segment', entry);
+          } else {
+            // Send interim back only to the speaker
+            socket.emit('stt:interim', { text });
+          }
+        } catch {}
+      };
+      if (dgConn && typeof dgConn.on === 'function') {
+        dgConn.on('transcript', handleTranscript);
+        dgConn.on('transcriptReceived', handleTranscript);
+      }
+    } catch (e) {
+      socket.emit('stt:dg:status', { ok: false, event: 'start_error', error: String(e && e.message || e) });
+    }
+  });
+
+  socket.on('stt:stream:chunk', async (chunk) => {
+    if (!chunk) return;
+    try {
+      // chunk can be Buffer or ArrayBuffer
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (buf && buf.length) {
+        if (dgConn) { try { dgConn.send(buf); } catch {} }
+        socket.emit('stt:dg:status', { ok: true, event: 'chunk_sent', bytes: buf.length });
+      }
+      // Save for batch fallback when using pcm16
+      try {
+        if (joinedRoom) {
+          const ra = ensureRoomAudio(joinedRoom);
+          // In batch-only mode we always store PCM16 chunks; client fallback sends Int16
+          ra.chunks.push(buf);
+        }
+      } catch {}
+    } catch (e) {
+      try { socket.emit('stt:dg:status', { ok: false, event: 'send_error', message: e?.message || 'send failed' }); } catch {}
+    }
+  });
+
+  socket.on('stt:stream:stop', async () => {
+    if (!dgConn) return;
+    try { await dgConn.finish(); } catch {}
+    dgConn = null;
   });
 
   // Transcript: collect final STT segments per room and broadcast
@@ -292,6 +517,9 @@ io.on('connection', (socket) => {
     if (joinedRoom && user) {
       socket.to(joinedRoom).emit('presence:leave', user);
     }
+    // Clean up any Deepgram connection for this socket
+    try { if (dgConn && typeof dgConn.finish === 'function') { dgConn.finish(); } } catch {}
+    dgConn = null;
   });
 });
 
